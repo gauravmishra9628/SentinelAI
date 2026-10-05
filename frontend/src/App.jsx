@@ -1,112 +1,54 @@
-import { useCallback, useEffect, useState } from 'react';
-import AIEngineStatus from './components/AIEngineStatus';
-import Analytics from './components/Analytics';
-import Header from './components/Header';
-import LiveMonitoring from './components/LiveMonitoring';
-import RecentAlerts from './components/RecentAlerts';
-import RiskDetection from './components/RiskDetection';
-import Sidebar from './components/Sidebar';
-import StatCard from './components/StatCard';
-import WelcomeSection from './components/WelcomeSection';
-import { demoDashboardData } from './data/demoData';
-import { getDashboard, getHealth } from './services/api';
+import { BrowserRouter, Route, Routes } from 'react-router-dom';
+import MainLayout from './layouts/MainLayout';
+import LoginPage from './pages/LoginPage';
+import Dashboard from './pages/Dashboard';
+import CommandCenter from './pages/CommandCenter';
+import LiveMonitoringPage from './pages/LiveMonitoringPage';
+import RiskDetectionPage from './pages/RiskDetectionPage';
+import AlertsPage from './pages/AlertsPage';
+import RoadMap from './pages/RoadMap';
+import CamerasPage from './pages/CamerasPage';
+import AnalyticsPage from './pages/AnalyticsPage';
+import PredictiveRiskPage from './pages/PredictiveRiskPage';
+import AIEnginePage from './pages/AIEnginePage';
+import AIAssistantPage from './pages/AIAssistantPage';
+import AICopilotPage from './pages/AICopilotPage';
+import ReportsPage from './pages/ReportsPage';
+import SettingsPage from './pages/SettingsPage';
+import SecurityPage from './pages/SecurityPage';
+import EmergencyResponsePage from './pages/EmergencyResponsePage';
+import IncidentsPage from './pages/IncidentsPage';
+import IncidentDetailsPage from './pages/IncidentDetailsPage';
+import InvestigationPage from './pages/InvestigationPage';
+import NotFound from './pages/NotFound';
 import './App.css';
 
-const App = () => {
-  const [dashboardData, setDashboardData] = useState(demoDashboardData);
-  const [isBackendOnline, setIsBackendOnline] = useState(null);
-  const [isLoading, setIsLoading] = useState(true);
-  const [apiError, setApiError] = useState('');
-  const [usingDemoData, setUsingDemoData] = useState(true);
-
-  const loadDashboard = useCallback(async () => {
-    setIsLoading(true);
-    setApiError('');
-
-    try {
-      const [health, dashboard] = await Promise.all([getHealth(), getDashboard()]);
-      setIsBackendOnline(health.status === 'ok');
-      setDashboardData(dashboard);
-      setUsingDemoData(false);
-    } catch (error) {
-      setIsBackendOnline(false);
-      setDashboardData(demoDashboardData);
-      setUsingDemoData(true);
-      setApiError(error.message || 'Backend unavailable');
-    } finally {
-      setIsLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    loadDashboard();
-    const interval = setInterval(loadDashboard, 30000);
-    return () => clearInterval(interval);
-  }, [loadDashboard]);
-
-  return (
-    <div className="app">
-      <Sidebar />
-      <main className="main-content">
-        <Header
-          alertCount={dashboardData.alerts.length}
-          systemStatus={isBackendOnline}
-        />
-
-        <WelcomeSection
-          isDemo={usingDemoData}
-          onRetry={loadDashboard}
-          systemStatus={isBackendOnline}
-        />
-
-        {(isLoading || apiError) && (
-          <div className={`data-banner ${apiError ? 'warning' : 'loading'}`}>
-            <span>{isLoading ? 'Loading live SentinelAI data...' : 'Backend unavailable. Showing clearly labeled demo data.'}</span>
-            {apiError && <button onClick={loadDashboard}>Retry</button>}
-          </div>
-        )}
-
-        <section className="dashboard-grid">
-          <div className="stats-row">
-            {dashboardData.statistics.map(stat => (
-              <StatCard key={stat.title} {...stat} />
-            ))}
-          </div>
-
-          <div className="primary-panels">
-            <LiveMonitoring
-              cameras={dashboardData.monitoring}
-              isDemo={usingDemoData}
-              isLoading={isLoading}
-            />
-            <RiskDetection
-              events={dashboardData.risks}
-              isDemo={usingDemoData}
-              isLoading={isLoading}
-            />
-          </div>
-
-          <div className="secondary-panels">
-            <RecentAlerts
-              alerts={dashboardData.alerts}
-              isDemo={usingDemoData}
-              isLoading={isLoading}
-            />
-            <Analytics
-              analytics={dashboardData.analytics}
-              isDemo={usingDemoData}
-              isLoading={isLoading}
-            />
-            <AIEngineStatus
-              engineData={dashboardData.aiEngineStatus}
-              isDemo={usingDemoData}
-              isLoading={isLoading}
-            />
-          </div>
-        </section>
-      </main>
-    </div>
-  );
-};
+const App = () => (
+  <BrowserRouter>
+    <Routes>
+      <Route path="/login" element={<LoginPage />} />
+      <Route path="/" element={<MainLayout><Dashboard /></MainLayout>} />
+      <Route path="/command-center" element={<MainLayout><CommandCenter /></MainLayout>} />
+      <Route path="/live-monitoring" element={<MainLayout><LiveMonitoringPage /></MainLayout>} />
+      <Route path="/risk-detection" element={<MainLayout><RiskDetectionPage /></MainLayout>} />
+      <Route path="/alerts" element={<MainLayout><AlertsPage /></MainLayout>} />
+      <Route path="/road-map" element={<MainLayout><RoadMap /></MainLayout>} />
+      <Route path="/cameras" element={<MainLayout><CamerasPage /></MainLayout>} />
+      <Route path="/analytics" element={<MainLayout><AnalyticsPage /></MainLayout>} />
+      <Route path="/ai-prediction" element={<MainLayout><PredictiveRiskPage /></MainLayout>} />
+      <Route path="/ai-engine" element={<MainLayout><AIEnginePage /></MainLayout>} />
+      <Route path="/ai-assistant" element={<MainLayout><AIAssistantPage /></MainLayout>} />
+      <Route path="/settings" element={<MainLayout><SettingsPage /></MainLayout>} />
+      <Route path="/security" element={<MainLayout><SecurityPage /></MainLayout>} />
+      <Route path="/emergency-response" element={<MainLayout><EmergencyResponsePage /></MainLayout>} />
+      <Route path="/incidents" element={<MainLayout><IncidentsPage /></MainLayout>} />
+      <Route path="/incidents/:incidentId" element={<MainLayout><IncidentDetailsPage /></MainLayout>} />
+      <Route path="/investigation/:incidentId?" element={<MainLayout><InvestigationPage /></MainLayout>} />
+      <Route path="/ai-copilot" element={<AICopilotPage />} />
+      <Route path="/reports" element={<ReportsPage />} />
+      <Route path="*" element={<MainLayout><NotFound /></MainLayout>} />
+    </Routes>
+  </BrowserRouter>
+);
 
 export default App;
