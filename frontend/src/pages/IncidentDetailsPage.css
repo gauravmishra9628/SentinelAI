@@ -1,0 +1,17 @@
+.incident-details-page .primary-panels { margin-bottom: 20px; }
+.incident-notes-card { margin-top: 4px; }
+.notes-heading, .note-form-footer, .note-item { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.notes-heading { margin-bottom: 16px; }
+.panel-muted { color: var(--text-muted); font-size: 13px; }
+.notes-role { border: 1px solid var(--border-subtle); border-radius: 999px; color: var(--accent); font-size: 11px; font-weight: 700; padding: 4px 9px; }
+.note-form textarea { width: 100%; min-height: 88px; resize: vertical; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); background: rgba(15, 23, 42, .6); color: var(--text); padding: 12px; font: inherit; }
+.note-form textarea:focus { outline: 2px solid var(--accent-border); }
+.note-form-footer { color: var(--text-muted); font-size: 12px; margin: 8px 0 18px; }
+.note-item { align-items: flex-start; border-top: 1px solid var(--border-subtle); padding: 14px 0; }
+.note-content { min-width: 0; }
+.note-content p { color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; }
+.note-content small { color: var(--text-muted); display: block; font-size: 12px; margin-top: 5px; }
+.note-delete { color: var(--color-danger); font-size: 12px; padding: 4px 0; }
+.note-delete:disabled { opacity: .55; }
+.notes-success { color: var(--color-safety); font-size: 13px; margin-bottom: 10px; }
+@media (max-width: 600px) { .notes-heading, .note-item { align-items: flex-start; flex-direction: column; } .note-delete { align-self: flex-end; } }

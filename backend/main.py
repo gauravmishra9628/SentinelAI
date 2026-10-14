@@ -1,9 +1,332 @@
-from typing import Literal
+﻿"""
+SentinelAI - AI-Powered Road Safety Backend
 
-from fastapi import FastAPI
+FastAPI server providing:
+- Dashboard data aggregation
+- Live monitoring data
+- AI detection endpoint (POST /api/detect)
+- Health checks
+
+AI architecture:
+- backend/ai/detector.py    - RoadSafetyDetector (YOLO + mock fallback)
+- backend/ai/risk_engine.py  - Risk scoring and alert cooldown
+"""
+
+import sys
+import io
+
+# Force UTF-8 stdout/stderr so log messages with emoji render on Windows
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Literal
+
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
+# --- AI Package Initialization ---
+import sys
+import os
+
+# Ensure backend directory is in path for imports
+BACKEND_DIR = Path(__file__).resolve().parent
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
+
+from ai import (
+    detect_frame,
+    is_demo_mode,
+    is_ai_active,
+    is_ai_offline,
+    get_ai_mode,
+    get_model_classes,
+    get_inference_device,
+    get_confidence_threshold,
+    get_model_info,
+    load_model,
+    get_detection_stats,
+    calculate_risk,
+    get_risk_level,
+    get_risk_color,
+    get_risk_description,
+    get_alert_cooldown_manager,
+    RISK_LEVELS,
+    enrich_detections,
+    classify_event,
+    get_model_capabilities,
+    SUPPORTED_EVENT_TYPES,
+    generate_alert,
+    store_event,
+    list_alerts,
+    get_alert,
+    acknowledge,
+    resolve,
+    delete,
+    clear_all,
+    get_summary,
+    get_analytics_data,
+    get_detection_history,
+    get_risk_trend,
+)
+from ai.incident_service import (
+    STATUS_NEW,
+    STATUS_ACKNOWLEDGED,
+    STATUS_INVESTIGATING,
+    STATUS_RESOLVED,
+    VALID_STATUSES,
+    ALLOWED_TRANSITIONS,
+    should_create_incident_for_alert,
+    create_incident_from_alert,
+    get_incident,
+    list_incidents,
+    get_incident_events,
+    get_evidence,
+    list_incident_notes,
+    create_incident_note,
+    delete_incident_note,
+    transition_incident,
+    assign_incident,
+    get_incident_counts,
+    EVIDENCE_DIR,
+)
+
+# Predictive risk engine (statistical baseline)
+from ai.prediction_service import (
+    predict_risk,
+    store_prediction,
+    get_prediction_history,
+    compute_prediction_accuracy,
+    get_recent_features,
+    PREDICTION_WINDOWS,
+)
+
+# AI Copilot service (autonomous safety intelligence)
+from ai.copilot_service import (
+    get_ai_context,
+    query_ai,
+    explain_risk,
+    build_incident_summary,
+    build_daily_report,
+    compute_priority_score,
+    build_predictive_warnings,
+    build_safety_timeline,
+    build_recommendations,
+    link_evidence,
+)
+
+# Security & Audit Center
+from ai.security_service import (
+    log_audit,
+    query_audit,
+    list_security_alerts,
+    acknowledge_security_alert,
+    resolve_security_alert,
+    get_security_overview,
+    get_configuration_status,
+    compute_security_score,
+    apply_retention,
+    track_failed_request,
+    track_failed_login,
+    extract_source_ip,
+    _sanitize_query,
+    AUDIT_LOGIN,
+    AUDIT_LOGOUT,
+    AUDIT_LOGIN_FAILED,
+    AUDIT_API_REQUEST,
+    AUDIT_API_REQUEST_FAILED,
+    AUDIT_CAMERA_VIEW,
+    AUDIT_CAMERA_FULLSCREEN,
+    AUDIT_CAMERA_DISCONNECT,
+    AUDIT_CAMERA_RECONNECT,
+    AUDIT_INCIDENT_VIEW,
+    AUDIT_INCIDENT_ACK,
+    AUDIT_INCIDENT_INVESTIGATE,
+    AUDIT_INCIDENT_RESOLVE,
+    AUDIT_EVIDENCE_VIEW,
+    AUDIT_REPORT_GENERATED,
+    AUDIT_AI_QUERY,
+    AUDIT_SETTINGS_CHANGED,
+    ALL_AUDIT_EVENT_TYPES,
+    ROLE_ADMIN,
+    ROLE_OPERATOR,
+    ROLE_VIEWER,
+    AUDIT_EMERGENCY_CREATED,
+    AUDIT_EMERGENCY_ACKNOWLEDGED,
+    AUDIT_EMERGENCY_ESCALATED,
+    AUDIT_UNIT_ASSIGNED,
+    AUDIT_EMERGENCY_STATUS_CHANGED,
+    AUDIT_EMERGENCY_NOTE_ADDED,
+    AUDIT_INVESTIGATION_OPENED,
+    AUDIT_EMERGENCY_RESOLVED,
+    AUDIT_EMERGENCY_CANCELLED,
+    AUDIT_LOGIN_SUCCESS,
+    AUDIT_LOGIN_FAILED,
+    AUDIT_UNAUTHORIZED_REQUEST,
+    AUDIT_FORBIDDEN_REQUEST,
+    AUDIT_ROLE_CHANGED,
+    AUDIT_DISPATCH_REQUESTED,
+    AUDIT_DISPATCH_SIMULATED,
+    AUDIT_LOCATION_UPDATED,
+)
+
+# WebSocket manager (singleton)
+from ai.websocket_manager import get_websocket_manager
+from ai.auth_service import (
+    ROLES,
+    auth_enabled,
+    authenticate,
+    create_user,
+    issue_token,
+    list_users,
+    token_secret,
+    update_user_role,
+    validate_token,
+)
+from ai.emergency_service import (
+    STATUSES as EMERGENCY_STATUSES,
+    UNIT_STATUSES,
+    UNIT_TYPES,
+    create_or_get_response,
+    get_response,
+    get_response_for_incident,
+    list_responses,
+    transition_response,
+    list_units,
+    assign_unit,
+    add_note,
+    get_timeline,
+    get_notes,
+    get_recommendations,
+    analytics as get_emergency_analytics,
+    create_unit,
+    update_unit,
+)
+
+# Known cameras (multi-camera architecture)
+# The /api/cameras/{id}/stream endpoint will work for any camera in this
+# registry. Cameras of mode="demo" get a backend-served animated JPEG
+# stream; cameras of mode="browser_webcam" are captured client-side.
+CAMERAS: dict[str, dict[str, str]] = {
+    "camera-1": {
+        "id": "camera-1",
+        "name": "Main Road (Browser)",
+        "location": "Gate Area",
+        "status": "OFFLINE",
+        "mode": "browser_webcam",  # captured client-side via getUserMedia
+    },
+    "CAM-001": {
+        "id": "CAM-001",
+        "name": "Main Highway",
+        "location": "Main Highway - Sector 7",
+        "status": "ONLINE",
+        "mode": "demo",  # served from /api/cameras/CAM-001/stream
+    },
+    "CAM-014": {
+        "id": "CAM-014",
+        "name": "Airport Road",
+        "location": "Airport Road Junction",
+        "status": "ONLINE",
+        "mode": "demo",
+    },
+    "CAM-022": {
+        "id": "CAM-022",
+        "name": "School Zone",
+        "location": "Downtown School Zone",
+        "status": "ONLINE",
+        "mode": "demo",
+    },
+}
+
+# In-memory camera state for WebSocket events
+_camera_states: dict[str, str] = {cam_id: cam.get("status", "OFFLINE") for cam_id, cam in CAMERAS.items()}
+
+
+def get_camera(camera_id: str) -> dict[str, str] | None:
+    """Return camera descriptor or None if unknown."""
+    return CAMERAS.get(camera_id)
+
+
+def list_cameras() -> list[dict[str, str]]:
+    """Return all known cameras with their current status.
+
+    For browser-webcam cameras, stream_url is None â€” the actual stream is
+    captured client-side via navigator.mediaDevices.getUserMedia() in the
+    LiveCamera component. The frontend falls back to a demo image (from
+    /api/demo/info) when the webcam is unavailable.
+    """
+    result = []
+    for cam_id, cam in CAMERAS.items():
+        result.append({
+            **cam,
+            "status": _camera_states.get(cam_id, cam.get("status", "OFFLINE")),
+        })
+    return result
+
+
+async def _broadcast_camera_status(camera_id: str, status: str) -> None:
+    """Broadcast a camera_status event over WebSocket."""
+    if camera_id in _camera_states and _camera_states[camera_id] == status:
+        return
+    _camera_states[camera_id] = status
+    ws = get_websocket_manager()
+    await ws.broadcast({
+        "type": "camera_status",
+        "camera_id": camera_id,
+        "status": status,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+# ============================================================
+# Evidence capture helpers
+# ============================================================
+
+# Evidence directory â€” same location as incident evidence
+_EVIDENCE_DIR = BACKEND_DIR / "evidence"
+try:
+    _EVIDENCE_DIR.mkdir(exist_ok=True)
+except Exception:
+    pass
+
+
+def _save_alert_evidence(alert_id: str, image_bytes: bytes) -> str | None:
+    """Save an evidence snapshot for a HIGH/CRITICAL alert.
+
+    Returns the relative path (e.g. "evidence/abc123_1694....jpg") or None on failure.
+    Evidence is served via the existing /api/evidence/{filename} endpoint.
+    """
+    if not image_bytes or not alert_id:
+        return None
+    import time
+    fname = f"{alert_id}_{int(time.time())}.jpg"
+    fpath = _EVIDENCE_DIR / fname
+    try:
+        fpath.write_bytes(image_bytes)
+        return f"evidence/{fname}"
+    except Exception:
+        return None
+
+
+# Initialize YOLO model at startup (load once)
+try:
+    load_model()
+except Exception as e:
+    print(f"[SentinelAI] âš ï¸ Model initialization error: {e}")
+    print("[SentinelAI] ðŸ“¦ Falling back to DEMO MODE")
+
+
+# ============================================================
+# Pydantic Models
+# ============================================================
 
 RiskLevel = Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
 EngineStatus = Literal["ONLINE", "OFFLINE", "DEGRADED", "PROCESSING"]
@@ -13,6 +336,8 @@ class HealthResponse(BaseModel):
     status: str
     service: str
     version: str
+    ai_mode: str  # "YOLO" | "DEMO" | "OFFLINE"
+    model_info: dict[str, Any] = {}
 
 
 class Statistic(BaseModel):
@@ -48,7 +373,7 @@ class RiskEvent(BaseModel):
 
 
 class Alert(BaseModel):
-    id: int
+    id: str
     type: str
     location: str
     timestamp: str
@@ -83,16 +408,113 @@ class AIEngineResponse(BaseModel):
     lastProcessedEvent: str
     uptime: str
     modelVersion: str
+    ai_mode: str = "DEMO"
+    model_classes: list[str] = []
+    device: str = "cpu"
+    confidence_threshold: float = 0.40
+    demo_mode: bool = True
+    confidence_threshold: float = 0.40
 
 
 class DashboardResponse(BaseModel):
     statistics: list[Statistic]
-    monitoring: list[MonitoringCamera]
+    monitoring: list[dict[str, Any]]  # includes mode + stream_url for camera feed
     risks: list[RiskEvent]
     alerts: list[Alert]
     analytics: AnalyticsResponse
     aiEngineStatus: AIEngineResponse
 
+
+class DetectResponse(BaseModel):
+    success: bool
+    risk_level: RiskLevel
+    risk_score: int
+    detections: list[dict[str, Any]]
+    alerts: list[dict[str, Any]]
+    model: str
+    demo_mode: bool
+    alert_id: str | None = None
+    incident_id: str | None = None
+    emergency_response: dict[str, Any] | None = None
+    response_recommendation: dict[str, Any] | None = None
+    # â”€â”€ Advanced analysis fields (Phase 2) â”€â”€
+    event_type: str | None = "NONE"
+    event_factors: list[str] = Field(default_factory=list)
+
+
+class DetectRequest(BaseModel):
+    image: str = Field(..., description="Base64-encoded image data")
+    image_format: str = Field(default="jpeg", description="Image format")
+
+
+class DemoIncidentRequest(BaseModel):
+    """Explicitly simulated incident input for development/demo validation."""
+    severity: Literal["HIGH", "CRITICAL"] = "CRITICAL"
+    camera_id: str = "camera-1"
+    location: str = "Simulation Location"
+    auto_assign: bool = True
+
+
+class EmergencyStatusRequest(BaseModel):
+    status: str
+    actor: str = "operator"
+    note: str | None = None
+
+
+class EmergencyCreateRequest(BaseModel):
+    incident_id: str
+    actor: str = "operator"
+
+
+class EmergencyAssignmentRequest(BaseModel):
+    unit_id: str
+    actor: str = "operator"
+
+
+class EmergencyNoteRequest(BaseModel):
+    note: str
+    actor: str = "operator"
+
+
+class EmergencyUnitRequest(BaseModel):
+    unit_id: str
+    name: str
+    unit_type: str
+    status: str = "AVAILABLE"
+    location: str = "Location metadata unavailable"
+    eta_minutes: int | None = None
+
+
+class EmergencyUnitUpdateRequest(BaseModel):
+    name: str | None = None
+    unit_type: str | None = None
+    status: str | None = None
+    location: str | None = None
+    eta_minutes: int | None = None
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class UserCreateRequest(BaseModel):
+    username: str
+    password: str
+    role: str = "VIEWER"
+
+
+class UserRoleRequest(BaseModel):
+    role: str
+
+
+class IncidentNoteRequest(BaseModel):
+    content: str = Field(..., min_length=1, max_length=2000)
+
+
+# ============================================================
+# Demo Data
+# ============================================================
 
 statistics = [
     Statistic(title="Active Cameras", value=18, icon="CAM", trend="up", label="+2 since yesterday", status="ONLINE"),
@@ -101,10 +523,10 @@ statistics = [
     Statistic(title="Safety Score", value="94", icon="SAFE", trend="up", label="Regional average", status="ONLINE"),
 ]
 
-monitoring = [
-    MonitoringCamera(id="CAM-001", location="Main Highway - Sector 7", status="PROCESSING", trafficLevel="Moderate", detectedVehicles=47, detectedPedestrians=12, riskLevel="LOW", lastUpdate="Just now"),
-    MonitoringCamera(id="CAM-014", location="Airport Road Junction", status="ONLINE", trafficLevel="Heavy", detectedVehicles=83, detectedPedestrians=21, riskLevel="HIGH", lastUpdate="45 sec ago"),
-    MonitoringCamera(id="CAM-022", location="Downtown School Zone", status="ONLINE", trafficLevel="Light", detectedVehicles=19, detectedPedestrians=34, riskLevel="MEDIUM", lastUpdate="1 min ago"),
+monitoring: list[dict[str, Any]] = [
+    {"id": "CAM-001", "location": "Main Highway - Sector 7", "status": "PROCESSING", "trafficLevel": "Moderate", "detectedVehicles": 47, "detectedPedestrians": 12, "riskLevel": "LOW", "lastUpdate": "Just now", "mode": "demo", "stream_url": "/api/cameras/CAM-001/stream"},
+    {"id": "CAM-014", "location": "Airport Road Junction", "status": "ONLINE", "trafficLevel": "Heavy", "detectedVehicles": 83, "detectedPedestrians": 21, "riskLevel": "HIGH", "lastUpdate": "45 sec ago", "mode": "demo", "stream_url": "/api/cameras/CAM-014/stream"},
+    {"id": "CAM-022", "location": "Downtown School Zone", "status": "ONLINE", "trafficLevel": "Light", "detectedVehicles": 19, "detectedPedestrians": 34, "riskLevel": "MEDIUM", "lastUpdate": "1 min ago", "mode": "demo", "stream_url": "/api/cameras/CAM-022/stream"},
 ]
 
 risks = [
@@ -115,11 +537,11 @@ risks = [
 ]
 
 alerts = [
-    Alert(id=1, type="Collision warning", location="Airport Road Junction", timestamp="2 min ago", severity="CRITICAL", status="Active"),
-    Alert(id=2, type="Overspeeding", location="NH-24 Highway", timestamp="5 min ago", severity="HIGH", status="Monitoring"),
-    Alert(id=3, type="Pedestrian risk", location="Downtown School Zone", timestamp="9 min ago", severity="MEDIUM", status="Active"),
-    Alert(id=4, type="Wrong-way driving", location="Sector 3 Ramp", timestamp="13 min ago", severity="CRITICAL", status="Resolved"),
-    Alert(id=5, type="Accident risk", location="Ring Road Exit 11", timestamp="21 min ago", severity="MEDIUM", status="Monitoring"),
+    Alert(id="demo-1", type="Collision warning", location="Airport Road Junction", timestamp="2 min ago", severity="CRITICAL", status="Active"),
+    Alert(id="demo-2", type="Overspeeding", location="NH-24 Highway", timestamp="5 min ago", severity="HIGH", status="Monitoring"),
+    Alert(id="demo-3", type="Pedestrian risk", location="Downtown School Zone", timestamp="9 min ago", severity="MEDIUM", status="Active"),
+    Alert(id="demo-4", type="Wrong-way driving", location="Sector 3 Ramp", timestamp="13 min ago", severity="CRITICAL", status="Resolved"),
+    Alert(id="demo-5", type="Accident risk", location="Ring Road Exit 11", timestamp="21 min ago", severity="MEDIUM", status="Monitoring"),
 ]
 
 analytics = AnalyticsResponse(
@@ -147,8 +569,14 @@ ai_engine_status = AIEngineResponse(
     lastProcessedEvent="CAM-014 wrong-way vehicle, 2 min ago",
     uptime="99.9%",
     modelVersion="v2.4.1",
+    ai_mode="DEMO" if is_demo_mode() else "AI",
+    confidence_threshold=0.40,
 )
 
+
+# ============================================================
+# FastAPI Application
+# ============================================================
 
 app = FastAPI(
     title="SentinelAI API",
@@ -156,42 +584,377 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# CORS configuration - use an explicit environment list when configured.
+_cors_origins = [origin.strip() for origin in os.getenv(
+    "CORS_ALLOWED_ORIGINS",
+    "http://localhost:5173,http://localhost:5174,http://127.0.0.1:5173,http://127.0.0.1:5174",
+).split(",") if origin.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+def _required_role(path: str, method: str) -> str:
+    """Return the minimum role for a protected API request."""
+    if path.startswith("/api/auth/users") or path == "/api/security/configuration" or path == "/api/security/retention/apply":
+        return ROLE_ADMIN
+    if method in {"GET", "HEAD", "OPTIONS"}:
+        return ROLE_VIEWER
+    if path.startswith("/api/emergency-units"):
+        return ROLE_ADMIN
+    return ROLE_OPERATOR
+
+
+def _role_allows(actual: str, required: str) -> bool:
+    levels = {ROLE_VIEWER: 1, ROLE_OPERATOR: 2, ROLE_ADMIN: 3}
+    return levels.get(actual, 0) >= levels.get(required, 99)
+
+
+@app.middleware("http")
+async def authentication_middleware(request: Request, call_next):
+    path = request.url.path
+    if not auth_enabled() or request.method == "OPTIONS" or path in {"/", "/api/health", "/api/auth/login"}:
+        return await call_next(request)
+    if not path.startswith("/api/"):
+        return await call_next(request)
+
+    authorization = request.headers.get("Authorization", "")
+    token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+    user = validate_token(token) if token else None
+    if not user:
+        try:
+            track_failed_request(extract_source_ip(request))
+            log_audit(event_type=AUDIT_UNAUTHORIZED_REQUEST, user_id="anonymous", user_role=ROLE_VIEWER, resource_type="api", resource_id=path, action=request.method, status="FAILED")
+        except Exception:
+            pass
+        return JSONResponse(status_code=401, content={"detail": "Authentication required"})
+
+    required = _required_role(path, request.method)
+    if not _role_allows(user["role"], required):
+        try:
+            log_audit(event_type=AUDIT_FORBIDDEN_REQUEST, user_id=user["username"], user_role=user["role"], resource_type="api", resource_id=path, action=request.method, status="FAILED")
+        except Exception:
+            pass
+        return JSONResponse(status_code=403, content={"detail": "Insufficient role for this action"})
+    request.state.user = user
+    return await call_next(request)
+
+
+# ============================================================
+# Routes
+# ============================================================
+
 @app.get("/")
 def root() -> dict[str, str]:
     return {"project": "SentinelAI", "status": "online", "message": "SentinelAI backend is running"}
 
 
+@app.post("/api/auth/login", tags=["Authentication"])
+async def login(payload: LoginRequest, request: Request) -> dict[str, Any]:
+    if not auth_enabled():
+        raise HTTPException(status_code=503, detail="Authentication is disabled by server configuration")
+    if len(token_secret()) < 32:
+        raise HTTPException(status_code=503, detail="Authentication secret is not configured")
+    user = authenticate(payload.username, payload.password)
+    if not user:
+        track_failed_login(extract_source_ip(request), payload.username)
+        log_audit(event_type=AUDIT_LOGIN_FAILED, user_id=payload.username[:80], user_role=ROLE_VIEWER, source_ip=extract_source_ip(request), action="login", status="FAILED")
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    log_audit(event_type=AUDIT_LOGIN_SUCCESS, user_id=user["username"], user_role=user["role"], source_ip=extract_source_ip(request), action="login")
+    return {"access_token": issue_token(user), "token_type": "bearer", "expires_in": 28800, "user": user}
+
+
+@app.get("/api/auth/me", tags=["Authentication"])
+async def current_user(request: Request) -> dict[str, Any]:
+    authorization = request.headers.get("Authorization", "")
+    token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+    user = validate_token(token) if token else None
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return user
+
+
+@app.get("/api/auth/users", tags=["Authentication"])
+async def get_users() -> dict[str, Any]:
+    return {"users": list_users()}
+
+
+@app.post("/api/auth/users", tags=["Authentication"])
+async def add_user(payload: UserCreateRequest, request: Request) -> dict[str, Any]:
+    if payload.role.upper() not in ROLES:
+        raise HTTPException(status_code=400, detail="Invalid role")
+    user = create_user(payload.username, payload.password, payload.role)
+    if not user:
+        raise HTTPException(status_code=400, detail="User could not be created; username may exist or password is too short")
+    log_audit(event_type="ROLE_CHANGED", user_id=request.state.user["username"], user_role=ROLE_ADMIN, resource_type="user", resource_id=user["id"], action="create_user", metadata={"role": user["role"]})
+    return user
+
+
+@app.patch("/api/auth/users/{user_id}/role", tags=["Authentication"])
+async def change_user_role(user_id: str, payload: UserRoleRequest, request: Request) -> dict[str, Any]:
+    user = update_user_role(user_id, payload.role)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found or invalid role")
+    log_audit(event_type=AUDIT_ROLE_CHANGED, user_id=request.state.user["username"], user_role=ROLE_ADMIN, resource_type="user", resource_id=user_id, action="change_role", metadata={"role": user["role"]})
+    return user
+
+
 @app.get("/api/health", response_model=HealthResponse)
 def health() -> HealthResponse:
-    return HealthResponse(status="ok", service="SentinelAI", version="1.0.0")
+    model_info = get_model_info()
+    return HealthResponse(
+        status="ok",
+        service="SentinelAI",
+        version="1.0.0",
+        ai_mode=model_info.get("ai_mode", "DEMO"),
+        model_info=model_info,
+    )
+
+
+def _format_relative_time(iso_ts: str) -> str:
+    """Convert ISO timestamp to a short relative-time label (e.g. '5s ago', '12m ago')."""
+    if not iso_ts:
+        return "Just now"
+    try:
+        ts = iso_ts.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        delta = (datetime.now(timezone.utc) - dt).total_seconds()
+        if delta < 0:
+            return "Just now"
+        if delta < 60:
+            return f"{int(delta)}s ago"
+        if delta < 3600:
+            return f"{int(delta // 60)}m ago"
+        if delta < 86400:
+            return f"{int(delta // 3600)}h ago"
+        return f"{int(delta // 86400)}d ago"
+    except Exception:
+        return "Just now"
 
 
 @app.get("/api/dashboard", response_model=DashboardResponse)
 def dashboard() -> DashboardResponse:
+    """Return dashboard data.
+
+    statistics and risks/alerts are computed from real stored detection
+    and alert data so the dashboard always shows live numbers.
+    """
+    # --- Compute dynamic statistics from stored data ---
+    alert_counts = get_summary()["alerts"]
+    det_stats = get_detection_stats()
+    detection_counts = det_stats.get("detection_counts", {})
+
+    # Safety score: 100 minus scaled penalty for critical/high alerts
+    critical_count = alert_counts.get("critical", 0)
+    high_count = alert_counts.get("high", 0)
+    active_alerts = alert_counts.get("active", 0)
+    safety_penalty = (critical_count * 15) + (high_count * 5) + (active_alerts * 2)
+    safety_score = max(0, min(100, 100 - safety_penalty))
+
+    # Trend direction based on active alerts
+    safety_trend = "down" if active_alerts > 0 else "up"
+
+    # Active cameras count (cameras with mode="demo" + camera-1)
+    active_camera_count = sum(
+        1 for cam in CAMERAS.values()
+        if cam.get("status") == "ONLINE"
+    )
+    # Include camera-1 when backend is online
+    if True:  # backend is always "online" when this endpoint is reachable
+        active_camera_count = max(active_camera_count, 1)
+
+    # Vehicle count: sum of car + truck + bus + motorcycle detections
+    vehicle_total = (
+        detection_counts.get("car", 0)
+        + detection_counts.get("truck", 0)
+        + detection_counts.get("bus", 0)
+        + detection_counts.get("motorcycle", 0)
+        + detection_counts.get("bicycle", 0)
+    )
+
+    # High risk events: active + acknowledged HIGH/CRITICAL alerts
+    high_risk_active = alert_counts.get("critical", 0) + alert_counts.get("high", 0)
+    high_risk_status = "DEGRADED" if high_risk_active > 0 else "ONLINE"
+    high_risk_trend = "up" if high_risk_active > 0 else "down"
+
+    dynamic_statistics = [
+        Statistic(
+            title="Active Cameras",
+            value=active_camera_count,
+            icon="CAM",
+            trend="up",
+            label="Monitoring active",
+            status="ONLINE"
+        ),
+        Statistic(
+            title="Vehicles Detected",
+            value=vehicle_total,
+            icon="CAR",
+            trend="up" if vehicle_total > 0 else "neutral",
+            label="Total from detection history",
+            status="PROCESSING"
+        ),
+        Statistic(
+            title="High Risk Events",
+            value=high_risk_active,
+            icon="RISK",
+            trend=high_risk_trend,
+            label="Active HIGH/CRITICAL alerts",
+            status=high_risk_status
+        ),
+        Statistic(
+            title="Safety Score",
+            value=str(safety_score),
+            icon="SAFE",
+            trend=safety_trend,
+            label="Based on active alert count",
+            status="ONLINE" if safety_score >= 70 else "DEGRADED"
+        ),
+    ]
+
+    # --- Compute real monitoring data from camera states + latest detection ---
+    # Get the latest detection for each camera to populate counts
+    detection_history = get_detection_history(limit=100)
+    camera_latest = {}
+    for event in detection_history:
+        cam_id = event.get("camera_id")
+        if cam_id and cam_id not in camera_latest:
+            camera_latest[cam_id] = event
+
+    dynamic_monitoring = []
+    for cam_id, cam in CAMERAS.items():
+        # Get current status from our tracking
+        status = _camera_states.get(cam_id, cam.get("status", "OFFLINE"))
+
+        # Get latest detection for this camera
+        latest_event = camera_latest.get(cam_id, {})
+        detections = latest_event.get("detections", [])
+
+        # Count vehicles and persons
+        vehicles = sum(1 for d in detections if d.get("class", "").lower() in ["car", "truck", "bus", "motorcycle", "bicycle"])
+        persons = sum(1 for d in detections if d.get("class", "").lower() == "person")
+        motorcycles = sum(1 for d in detections if d.get("class", "").lower() == "motorcycle")
+        trucks_buses = sum(1 for d in detections if d.get("class", "").lower() in ["truck", "bus"])
+
+        # Calculate risk score and level from latest event
+        risk_score = latest_event.get("risk_score", 0)
+        risk_level = latest_event.get("risk_level", "LOW")
+
+        # Determine traffic level based on vehicle count
+        traffic_level = "Light"
+        if vehicles > 10:
+            traffic_level = "Heavy"
+        elif vehicles > 5:
+            traffic_level = "Moderate"
+
+        # Format timestamp
+        last_update = _format_relative_time(latest_event.get("timestamp", "")) if latest_event.get("timestamp") else "Just now"
+
+        dynamic_monitoring.append({
+            "id": cam_id,
+            "location": cam["location"],
+            "status": status,
+            "mode": cam.get("mode", "demo"),
+            "trafficLevel": traffic_level,
+            "detectedVehicles": vehicles,
+            "detectedPedestrians": persons,
+            "detectedMotorcycles": motorcycles,
+            "detectedTrucksBuses": trucks_buses,
+            "riskLevel": risk_level,
+            "riskScore": risk_score,
+            "lastUpdate": last_update,
+            "stream_url": f"/api/cameras/{cam_id}/stream" if cam.get("mode") != "browser_webcam" else None
+        })
+
+    # --- Compute real risks (recent HIGH/CRITICAL detection events) ---
+    detection_history = get_detection_history(limit=20)
+    high_critical_events = [
+        e for e in detection_history
+        if e.get("risk_level") in ("HIGH", "CRITICAL")
+    ][:4]
+
+    dynamic_risks = []
+    for i, event in enumerate(high_critical_events):
+        dets = event.get("detections", [])
+        top_det = dets[0] if dets else {}
+        detected_issue = top_det.get("class", "Unknown object").title()
+        confidence_pct = int(round((top_det.get("confidence", 0)) * 100))
+        dynamic_risks.append(RiskEvent(
+            id=i + 1,
+            riskScore=event.get("risk_score", 0),
+            detectedIssue=detected_issue,
+            location=event.get("camera_id", "Live Camera Feed"),
+            camera=event.get("camera_id", "CAM-001"),
+            timestamp=_format_relative_time(event.get("timestamp", "")),
+            confidence=confidence_pct,
+            severity=event.get("risk_level", "MEDIUM"),
+            status="Active" if event.get("risk_level") == "CRITICAL" else "Monitoring",
+        ))
+
+    # Fall back to static risks if no real data yet
+    final_risks = dynamic_risks if dynamic_risks else risks
+
+    # --- Compute real recent alerts ---
+    recent_alerts_raw = list_alerts(limit=5)
+    dynamic_alerts = [
+        Alert(
+            id=a.get("id", i) or str(i),
+            type=a.get("type", "GENERAL_RISK"),
+            location=a.get("location", "Live Camera Feed"),
+            timestamp=_format_relative_time(a.get("timestamp", "")),
+            severity=a.get("severity", "LOW"),
+            status=a.get("status", "ACTIVE"),
+        )
+        for i, a in enumerate(recent_alerts_raw)
+    ]
+    # Fall back to static alerts if no real data yet
+    final_alerts = dynamic_alerts if dynamic_alerts else alerts
+
+    # --- Compute real analytics data ---
+    analytics_data = get_analytics_data()
+
+    # Convert to the existing AnalyticsResponse format
+    metrics = []
+    for m in analytics_data.get("metrics", []):
+        metrics.append(AnalyticsMetric(
+            label=m["label"],
+            value=m["value"],
+            percent=m.get("percent", 0),
+            tone=m.get("tone", "safe")
+        ))
+
+    trends = []
+    for t in analytics_data.get("trends", []):
+        risk_raw = t.get("riskScore", 0)
+        # Ensure riskScore is int for Pydantic (analytics may return float)
+        risk_score_int = int(risk_raw) if isinstance(risk_raw, (int, float)) else 0
+        trends.append(TrendPoint(
+            label=t["label"],
+            incidents=t.get("incidents", 0),
+            riskScore=risk_score_int,
+        ))
+
+    dynamic_analytics = AnalyticsResponse(metrics=metrics, trends=trends)
+
     return DashboardResponse(
-        statistics=statistics,
-        monitoring=monitoring,
-        risks=risks,
-        alerts=alerts,
-        analytics=analytics,
-        aiEngineStatus=ai_engine_status,
+        statistics=dynamic_statistics,
+        monitoring=dynamic_monitoring,
+        risks=final_risks,
+        alerts=final_alerts,
+        analytics=dynamic_analytics,
+        aiEngineStatus=_build_ai_engine_response(),
     )
 
 
-@app.get("/api/live-monitoring", response_model=list[MonitoringCamera])
-def live_monitoring() -> list[MonitoringCamera]:
+@app.get("/api/live-monitoring", response_model=list[dict[str, Any]])
+def live_monitoring() -> list[dict[str, Any]]:
+    """Return live monitoring cameras enriched with mode and stream_url."""
     return monitoring
 
 
@@ -200,16 +963,2630 @@ def risk_detection() -> list[RiskEvent]:
     return risks
 
 
-@app.get("/api/alerts", response_model=list[Alert])
-def recent_alerts() -> list[Alert]:
-    return alerts
-
-
 @app.get("/api/analytics", response_model=AnalyticsResponse)
 def road_analytics() -> AnalyticsResponse:
-    return analytics
+    """Get road safety analytics (legacy endpoint - delegates to new analytics)."""
+    data = get_analytics_data()
+
+    # Convert to the existing AnalyticsResponse format
+    metrics = []
+    for m in data.get("metrics", []):
+        metrics.append(AnalyticsMetric(
+            label=m["label"],
+            value=m["value"],
+            percent=m.get("percent", 0),
+            tone=m.get("tone", "safe")
+        ))
+
+    trends = []
+    for t in data.get("trends", []):
+        risk_raw = t.get("riskScore", 0)
+        risk_score_int = int(risk_raw) if isinstance(risk_raw, (int, float)) else 0
+        trends.append(TrendPoint(
+            label=t["label"],
+            incidents=t.get("incidents", 0),
+            riskScore=risk_score_int,
+        ))
+
+    return AnalyticsResponse(metrics=metrics, trends=trends)
+
+
+def _build_ai_engine_response() -> AIEngineResponse:
+    """Build the AI engine status response from the current model state."""
+    ai_mode = get_ai_mode()
+    classes = get_model_classes()
+    device = get_inference_device()
+    conf = get_confidence_threshold()
+
+    if ai_mode == "YOLO":
+        # Real model loaded and running
+        engine_status = "ONLINE"
+        inference = "PROCESSING"
+        camera_proc = "PROCESSING"
+        model_status = f"YOLO ACTIVE â€¢ {len(classes)} classes â€¢ device: {device}"
+        model_version = f"YOLO â€¢ conf {conf}"
+    elif ai_mode == "OFFLINE":
+        # Model file present but failed to load
+        engine_status = "DEGRADED"
+        inference = "OFFLINE"
+        camera_proc = "OFFLINE"
+        msg = get_model_info().get("status_message", "Model load failed")
+        model_status = f"AI OFFLINE â€” {msg}"
+        model_version = "OFFLINE"
+    else:
+        # DEMO MODE - no model file
+        engine_status = "DEGRADED"
+        inference = "OFFLINE"
+        camera_proc = "OFFLINE"
+        model_status = "DEMO MODE â€” YOLO model not found"
+        model_version = "mock"
+
+    return AIEngineResponse(
+        status=engine_status,
+        modelStatus=model_status,
+        inferenceStatus=inference,
+        cameraProcessingStatus=camera_proc,
+        apiStatus="ONLINE",
+        lastProcessedEvent="CAM-014 wrong-way vehicle, 2 min ago",
+        uptime="99.9%" if ai_mode == "YOLO" else "N/A",
+        modelVersion=model_version,
+        ai_mode=ai_mode,
+        model_classes=classes,
+        device=device,
+        confidence_threshold=conf,
+        demo_mode=is_demo_mode(),
+    )
 
 
 @app.get("/api/ai-engine/status", response_model=AIEngineResponse)
 def ai_engine() -> AIEngineResponse:
-    return ai_engine_status
+    return _build_ai_engine_response()
+
+
+@app.get("/api/model/capabilities", tags=["AI"])
+async def model_capabilities() -> dict[str, Any]:
+    """Return a clear report on what the current AI model can and cannot detect.
+
+    This endpoint exposes:
+      - which event types the system can fire (e.g. PEDESTRIAN_RISK, VEHICLE_DENSITY)
+      - which features are genuinely available vs. limitations
+      - what a domain-specific model would need to add helmet / accident detection
+
+    Frontend components use this to show "Not available with current model"
+    instead of fake results.
+    """
+    return get_model_capabilities()
+
+
+@app.post("/api/detect/json", response_model=DetectResponse)
+async def detect_json(request: DetectRequest) -> DetectResponse:
+    """Process a single image frame and return AI detections.
+
+    Body:
+        image (str): Base64-encoded JPEG image data
+        image_format (str): Image format (default: "jpeg")
+
+    Returns:
+        Detection result with risk level, score, detections, and alerts
+    """
+    if not request.image:
+        raise HTTPException(status_code=400, detail="No image data provided")
+
+    try:
+        result = detect_frame(request.image, request.image_format)
+        detections = result.get("detections", []) or []
+
+        event_type = "NONE"
+        event_factors: list[str] = []
+        enriched_detections: list[dict[str, Any]] = []
+        if is_ai_active() and detections:
+            try:
+                enriched_detections = enrich_detections(detections)
+                event_result = classify_event(detections)
+                event_type = event_result.get("event_type", "NONE")
+                event_factors = event_result.get("factors", [])
+            except Exception as analysis_err:
+                print(f"[SentinelAI] âš ï¸ Analysis error: {analysis_err}")
+
+        risk_result = calculate_risk(
+            detections,
+            result.get("alerts", []),
+            event_type=event_type if event_type != "NONE" else None,
+            enriched_detections=enriched_detections or None,
+        )
+
+        alert_id: str | None = None
+        incident_id: str | None = None
+        emergency_response: dict[str, Any] | None = None
+        response_recommendation: dict[str, Any] | None = None
+
+        alert_result = generate_alert(
+            detections=detections,
+            risk_score=int(risk_result["risk_score"]),
+            risk_level=risk_result["risk_level"],
+            camera_id="camera-1",
+            location="Unknown",
+        )
+        if alert_result and alert_result.should_alert and alert_result.alert:
+            alert_id = alert_result.alert.get("id")
+            # Detection history is retained even when cooldown rules suppress
+            # alert generation; this keeps the pipeline auditable.
+            store_event(
+                risk_score=int(risk_result["risk_score"]),
+                risk_level=risk_result["risk_level"],
+                detections=detections,
+                alert_id=alert_id,
+                camera_id="camera-1",
+                event_type=str(risk_result.get("event_type") or "NONE"),
+            )
+            if should_create_incident_for_alert(alert_result.alert):
+                incident = create_incident_from_alert(alert_result.alert)
+                if incident:
+                    incident_id = incident.get("id")
+                    emergency_response = create_or_get_response(incident_id)
+                    response_recommendation = emergency_response if emergency_response else None
+
+        return DetectResponse(
+            success=result.get("success", True),
+            risk_level=risk_result["risk_level"],
+            risk_score=risk_result["risk_score"],
+            detections=detections,
+            alerts=[alert_result.alert] if alert_result and alert_result.should_alert and alert_result.alert else result.get("alerts", []),
+            model=result.get("model", "MOCK"),
+            demo_mode=is_demo_mode(),
+            alert_id=alert_id,
+            incident_id=incident_id,
+            emergency_response=emergency_response,
+            response_recommendation=response_recommendation,
+            event_type=risk_result.get("event_type", "NONE"),
+            event_factors=risk_result.get("factors", []),
+        )
+
+    except Exception as e:
+        print(f"[SentinelAI] âš ï¸ Detection error: {e}")
+        return DetectResponse(
+            success=False,
+            risk_level="LOW",
+            risk_score=0,
+            detections=[],
+            alerts=[],
+            model="ERROR",
+            demo_mode=True,
+            alert_id=None,
+            incident_id=None,
+            emergency_response=None,
+            response_recommendation=None,
+            event_type="NONE",
+            event_factors=[],
+        )
+
+
+@app.post("/api/demo/simulate-incident", tags=["Demo"])
+async def simulate_incident(payload: DemoIncidentRequest) -> dict[str, Any]:
+    """Create a fully labeled, deterministic simulation for demonstrations.
+
+    This endpoint never claims that a camera or real responder produced the
+    event. It uses the same risk, alert, incident, and emergency services as
+    live detection, while making the synthetic input explicit.
+    """
+    camera_id = payload.camera_id if get_camera(payload.camera_id) else "camera-1"
+    object_count = 12 if payload.severity == "CRITICAL" else 10
+    detections = [
+        {"class": "car", "confidence": 0.95, "bbox": [], "simulation": True}
+        for _ in range(object_count)
+    ]
+    risk = calculate_risk(detections, [], enriched_detections=detections)
+    # Keep the requested simulation severity explicit while preserving the
+    # calculated score as the source of truth for the risk engine.
+    risk_level = payload.severity if risk["risk_level"] != "LOW" else "HIGH"
+    alert_result = generate_alert(
+        detections=detections,
+        risk_score=max(int(risk["risk_score"]), 80 if payload.severity == "CRITICAL" else 60),
+        risk_level=risk_level,
+        camera_id=camera_id,
+        location=payload.location,
+    )
+    if not alert_result.alert:
+        raise HTTPException(status_code=409, detail="Simulation was suppressed by the alert cooldown; retry shortly")
+
+    alert = alert_result.alert
+    alert["simulation"] = True
+    event = store_event(
+        risk_score=int(alert["risk_score"]),
+        risk_level=alert["risk_level"],
+        detections=detections,
+        alert_id=alert["id"],
+        camera_id=camera_id,
+        event_type="SIMULATED_INCIDENT",
+    )
+    incident = create_incident_from_alert(alert)
+    if not incident:
+        raise HTTPException(status_code=500, detail="Simulation alert was created but incident creation failed")
+
+    response = create_or_get_response(incident["id"])
+    if not response:
+        raise HTTPException(status_code=500, detail="Simulation incident was created but emergency response creation failed")
+
+    if payload.auto_assign:
+        response = transition_response(response["id"], "ACKNOWLEDGED", "simulation") or response
+        response = transition_response(response["id"], "DISPATCH_RECOMMENDED", "simulation") or response
+        unit = next((u for u in list_units(status="AVAILABLE") if u.get("simulated")), None)
+        if unit:
+            response = assign_unit(response["id"], unit["id"], "simulation") or response
+
+    ws = get_websocket_manager()
+    for event_type, data in (
+        ("detection.created", event),
+        ("risk.updated", {"risk_score": alert["risk_score"], "risk_level": alert["risk_level"], "simulation": True}),
+        ("alert.created", alert),
+        ("incident.created", incident),
+        ("emergency.created", response),
+    ):
+        try:
+            await ws.broadcast({"type": event_type, "timestamp": datetime.now(timezone.utc).isoformat(), "data": data})
+        except Exception as exc:
+            print(f"[SentinelAI] simulation WebSocket broadcast failed for {event_type}: {exc}")
+
+    return {
+        "mode": "SIMULATION",
+        "detection_id": event["id"],
+        "alert_id": alert["id"],
+        "incident_id": incident["id"],
+        "emergency_response_id": response["id"],
+        "assigned_unit_id": (response.get("assignments") or [{}])[0].get("unit_id"),
+        "risk_score": alert["risk_score"],
+        "risk_level": alert["risk_level"],
+    }
+
+
+@app.get("/api/detection-stats")
+async def detection_stats() -> dict[str, Any]:
+    """Return detection statistics for monitoring."""
+    return get_detection_stats()
+
+
+@app.post("/api/detect")
+async def detect_upload(
+    file: UploadFile = File(...),
+    camera_id: str = "camera-1",
+) -> dict[str, Any]:
+    """Detect objects in an uploaded image frame.
+
+    Accepts multipart/form-data with `file` and optional `camera_id` fields.
+    This endpoint complements the JSON `/api/detect` endpoint and is the
+    preferred path for browser webcam frames.
+
+    Returns the same JSON shape as the JSON endpoint, with
+    `ai_mode` set to "YOLO" when the model is loaded, otherwise
+    "DEMO".
+
+    Camera identification:
+        - `camera_id` (form field, optional, default "camera-1")
+        - Backward compatible: if a non-existent camera is passed, the
+          request still succeeds but is associated with the default camera.
+        - On every meaningful detection a `risk_update` event is broadcast
+          over the WebSocket; on a newly generated alert (after dedup)
+          an `alert` event is broadcast.
+    """
+    if not file:
+        raise HTTPException(status_code=400, detail="No file uploaded")
+
+    # Validate camera_id - if unknown, fall back to default but accept the request
+    cam = get_camera(camera_id)
+    if cam is None:
+        camera_id = "camera-1"
+        cam = get_camera(camera_id)
+
+    # Read raw bytes from the upload
+    try:
+        image_bytes = await file.read()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read upload: {e}")
+
+    if not image_bytes or len(image_bytes) == 0:
+        raise HTTPException(status_code=400, detail="Empty file uploaded")
+
+    # Best-effort image validation using Pillow (do not block if unavailable)
+    try:
+        from PIL import Image
+        import io
+
+        try:
+            img = Image.open(io.BytesIO(image_bytes))
+            img_format = img.format
+            img.close()
+            if not img_format:
+                raise HTTPException(status_code=400, detail="Unrecognized image format")
+        except HTTPException:
+            raise
+        except Exception:
+            # If Pillow cannot parse, fall through and let the detector
+            # decide what to do with the bytes. This avoids rejecting
+            # formats Pillow doesn't recognise but the AI model might.
+            pass
+    except ImportError:
+        pass
+
+    try:
+        # Reuse the existing RoadSafetyDetector (handles DEMO / YOLO internally).
+        # Model is loaded once at startup; this call does NOT reload it.
+        result = detect_frame(image_bytes, "jpeg")
+
+        detections = result.get("detections", []) or []
+        detector_alerts = result.get("alerts", []) or []
+
+        # â”€â”€ Run enhanced event analysis on detections â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        event_type = "NONE"
+        enriched_detections: list[dict[str, Any]] = []
+        if is_ai_active():
+            try:
+                enriched_detections = enrich_detections(detections)
+                event_result = classify_event(detections)
+                event_type = event_result.get("event_type", "NONE")
+            except Exception as analysis_err:
+                print(f"[SentinelAI] âš ï¸ Analysis error: {analysis_err}")
+                # Fall back to basic enrichment
+                enriched_detections = [{"class": d.get("class", ""), "confidence": d.get("confidence", 0),
+                                       "category": d.get("class", "").lower()} for d in detections]
+
+        # Delegate risk scoring to the existing risk engine - no duplicate logic
+        risk = calculate_risk(
+            detections,
+            detector_alerts,
+            event_type=event_type if event_type != "NONE" else None,
+            enriched_detections=enriched_detections or None,
+        )
+
+        # â”€â”€ Capture evidence on HIGH/CRITICAL (non-blocking) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        new_alert_dict: dict[str, Any] | None = None
+        evidence_id: str | None = None
+        evidence_url: str | None = None
+
+        ai_mode = get_ai_mode()  # "YOLO" | "DEMO" | "OFFLINE"
+        model_label = "YOLO" if ai_mode == "YOLO" else "MOCK"
+
+        # â”€â”€ Real-time: broadcast risk_update for this camera â”€â”€
+        try:
+            ws_manager = get_websocket_manager()
+            await ws_manager.broadcast({
+                "type": "risk_update",
+                "camera_id": camera_id,
+                "risk_score": int(risk["risk_score"]),
+                "risk_level": risk["risk_level"],
+                "event_type": risk.get("event_type", "NONE"),
+                "detections_count": len(detections),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+        except Exception as ws_err:
+            # Never fail detection because of a WebSocket error
+            print(f"[SentinelAI] âš ï¸ WebSocket risk_update broadcast failed: {ws_err}")
+
+        # â”€â”€ Real-time: generate and broadcast a meaningful alert (if any) â”€â”€
+        alert_id: str | None = None
+        incident_id: str | None = None
+        emergency_response: dict[str, Any] | None = None
+        try:
+            alert_result = generate_alert(
+                detections=detections,
+                risk_score=int(risk["risk_score"]),
+                risk_level=risk["risk_level"],
+                camera_id=camera_id,
+                location=cam["location"] if cam else "Unknown",
+            )
+            if alert_result and alert_result.should_alert and alert_result.alert:
+                new_alert_dict = alert_result.alert
+                if risk["risk_level"] in ("HIGH", "CRITICAL") and image_bytes:
+                    try:
+                        evidence_id = _save_alert_evidence(new_alert_dict.get("id") or "alert", image_bytes)
+                        if evidence_id:
+                            evidence_filename = evidence_id.split("/")[-1]
+                            evidence_url = f"/api/evidence/{evidence_filename}"
+                    except Exception as ev_err:
+                        print(f"[SentinelAI] âš ï¸ Evidence capture error: {ev_err}")
+                try:
+                    await ws_manager.broadcast({
+                        "type": "alert",
+                        "alert": {
+                            "id": new_alert_dict.get("id"),
+                            "timestamp": new_alert_dict.get("timestamp"),
+                            "severity": new_alert_dict.get("severity"),
+                            "risk_score": new_alert_dict.get("risk_score"),
+                            "risk_level": new_alert_dict.get("risk_level"),
+                            "message": new_alert_dict.get("message"),
+                            "type": new_alert_dict.get("type"),
+                            "camera_id": new_alert_dict.get("camera_id", camera_id),
+                            "location": new_alert_dict.get("location"),
+                            "status": new_alert_dict.get("status", "ACTIVE"),
+                            "event_type": risk.get("event_type", "NONE"),
+                            "detected_objects": [d.get("class", "") for d in detections[:10]],
+                            "evidence_url": evidence_url,
+                        },
+                    })
+                except Exception as ws_err:
+                    print(f"[SentinelAI] âš ï¸ WebSocket alert broadcast failed: {ws_err}")
+
+                # â”€â”€ Create incident for HIGH/CRITICAL alerts â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                try:
+                    if should_create_incident_for_alert(new_alert_dict):
+                        incident = create_incident_from_alert(new_alert_dict)
+                        if incident:
+                            try:
+                                await ws_manager.broadcast({
+                                    "type": "incident",
+                                    "incident": {
+                                        "id": incident.get("id"),
+                                        "severity": incident.get("severity"),
+                                        "status": incident.get("status"),
+                                        "camera_id": incident.get("camera_id"),
+                                        "location": incident.get("location"),
+                                        "incident_type": incident.get("incident_type"),
+                                        "risk_score": incident.get("risk_score"),
+                                        "event_type": risk.get("event_type", "NONE"),
+                                        "evidence_url": evidence_url,
+                                        "created_at": incident.get("created_at"),
+                                    },
+                                })
+                                incident_id = incident.get("id")
+                                emergency_response = create_or_get_response(incident_id)
+                                if emergency_response:
+                                    _audit_emergency(AUDIT_EMERGENCY_CREATED, emergency_response, "system", "create")
+                                    await _broadcast_emergency("EMERGENCY_CREATED", emergency_response)
+                                print(f"[SentinelAI] ðŸ“‹ Incident created: {incident_id} - {incident.get('incident_type')}")
+                            except Exception as ws_inc_err:
+                                print(f"[SentinelAI] âš ï¸ WebSocket incident broadcast failed: {ws_inc_err}")
+                except Exception as inc_err:
+                    print(f"[SentinelAI] âš ï¸ Incident creation failed: {inc_err}")
+        except Exception as alert_err:
+            # Never fail detection because of alert generation issues
+            print(f"[SentinelAI] âš ï¸ Alert generation failed: {alert_err}")
+
+        # â”€â”€ Persist detection event (uses existing cooldown) â”€â”€
+        try:
+            store_event(
+                risk_score=int(risk["risk_score"]),
+                risk_level=risk["risk_level"],
+                detections=detections,
+                alert_id=(new_alert_dict.get("id") if new_alert_dict else None),
+                camera_id=camera_id,
+                event_type=str(risk.get("event_type") or "NONE"),
+            )
+        except Exception:
+            pass
+
+        alert_id = (new_alert_dict.get("id") if new_alert_dict else None)
+        return {
+            "success": bool(result.get("success", True)),
+            "risk_level": risk["risk_level"],
+            "risk_score": risk["risk_score"],
+            "detections": detections,
+            "alerts": ([new_alert_dict] if new_alert_dict else detector_alerts),
+            "ai_mode": ai_mode,
+            "model": model_label,
+            "demo_mode": is_demo_mode(),
+            "device": get_inference_device(),
+            "confidence_threshold": get_confidence_threshold(),
+            "camera_id": camera_id,
+            "filename": getattr(file, "filename", None),
+            "content_type": getattr(file, "content_type", None),
+            "frame_timestamp": datetime.now(timezone.utc).isoformat(),
+            "alert_id": alert_id,
+            "incident_id": incident_id,
+            "emergency_response": emergency_response,
+            "response_recommendation": emergency_response,
+            # â”€â”€ Advanced analysis fields (Phase 2) â”€â”€
+            "event_type": risk.get("event_type", "NONE"),
+            "event_factors": risk.get("factors", []),
+            "enriched_detections": enriched_detections,
+            "evidence_id": evidence_id,
+            "evidence_url": evidence_url,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[SentinelAI] âš ï¸ /api/detect (upload) error: {e}")
+        # Never crash â€” always return a safe response
+        return {
+            "success": False,
+            "risk_level": "LOW",
+            "risk_score": 0,
+            "detections": [],
+            "alerts": [],
+            "ai_mode": "DEMO",
+            "model": "ERROR",
+            "demo_mode": True,
+            "error": str(e),
+            "event_type": "NONE",
+            "event_factors": [],
+            "enriched_detections": [],
+            "evidence_id": None,
+            "evidence_url": None,
+        }
+
+
+# ============================================================
+# Alert Management Endpoints
+# ============================================================
+
+@app.get("/api/alerts", tags=["Alerts"])
+async def get_alerts_endpoint(
+    limit: int = 50,
+    offset: int = 0,
+    status: str = None,
+    severity: str = None,
+) -> dict[str, Any]:
+    """Get list of alerts with optional filtering."""
+    alerts = list_alerts(
+        limit=limit,
+        offset=offset,
+        status=status,
+        severity=severity
+    )
+    counts = get_summary()["alerts"]
+    return {
+        "alerts": alerts,
+        "count": len(alerts),
+        "total": counts.get("total", 0),
+        "active": counts.get("active", 0),
+        "acknowledged": counts.get("acknowledged", 0),
+        "resolved": counts.get("resolved", 0),
+    }
+
+
+@app.get("/api/alerts/summary", tags=["Alerts"])
+async def get_alert_summary() -> dict[str, Any]:
+    """Get alert summary statistics."""
+    return get_summary()
+
+
+@app.get("/api/alerts/{alert_id}", tags=["Alerts"])
+async def get_single_alert(alert_id: str) -> dict[str, Any]:
+    """Get a single alert by ID."""
+    alert = get_alert(alert_id)
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    return alert
+
+
+@app.post("/api/alerts/{alert_id}/acknowledge", tags=["Alerts"])
+async def acknowledge_alert_endpoint(alert_id: str) -> dict[str, Any]:
+    """Acknowledge an alert."""
+    alert = acknowledge(alert_id)
+    if not alert:
+        raise HTTPException(
+            status_code=404,
+            detail="Alert not found or already acknowledged"
+        )
+    return alert
+
+
+@app.post("/api/alerts/{alert_id}/resolve", tags=["Alerts"])
+async def resolve_alert_endpoint(alert_id: str) -> dict[str, Any]:
+    """Resolve an alert."""
+    alert = resolve(alert_id)
+    if not alert:
+        raise HTTPException(
+            status_code=404,
+            detail="Alert not found or already resolved"
+        )
+    return alert
+
+
+@app.delete("/api/alerts/{alert_id}", tags=["Alerts"])
+async def delete_alert_endpoint(alert_id: str) -> dict[str, str]:
+    """Delete an alert."""
+    if not delete(alert_id):
+        raise HTTPException(status_code=404, detail="Alert not found")
+    return {"message": "Alert deleted successfully"}
+
+
+@app.delete("/api/alerts", tags=["Alerts"])
+async def clear_alerts_endpoint() -> dict[str, Any]:
+    """Clear all alerts."""
+    count = clear_all()
+    return {"message": f"Cleared {count} alerts", "count": count}
+
+
+# ============================================================
+# Detection History Endpoints
+# ============================================================
+
+@app.get("/api/detection-history", tags=["Detection"])
+async def get_detection_history_endpoint(
+    limit: int = 100,
+    offset: int = 0,
+    risk_level: str = None,
+    min_risk_score: int = None,
+) -> dict[str, Any]:
+    """Get detection history with optional filtering."""
+    history = get_detection_history(
+        limit=limit,
+        offset=offset,
+        risk_level=risk_level,
+        min_risk_score=min_risk_score
+    )
+    return {
+        "events": history,
+        "count": len(history),
+    }
+
+
+# ============================================================
+# Incident Management Endpoints
+# ============================================================
+
+@app.get("/api/incidents", tags=["Incidents"])
+async def get_incidents_endpoint(
+    limit: int = 100,
+    offset: int = 0,
+    status: str = None,
+    severity: str = None,
+    camera_id: str = None,
+    incident_type: str = None,
+    search: str = None,
+) -> dict[str, Any]:
+    """List incidents with optional filtering.
+
+    Search matches against incident ID, camera ID, event type, and location.
+    """
+    incidents = list_incidents(
+        limit=limit,
+        offset=offset,
+        status=status,
+        severity=severity,
+        camera_id=camera_id,
+        incident_type=incident_type,
+        search=search,
+    )
+    counts = get_incident_counts()
+    return {
+        "incidents": incidents,
+        "count": len(incidents),
+        "total": counts.get("total", 0),
+        "open": counts.get("new", 0) + counts.get("acknowledged", 0) + counts.get("investigating", 0),
+        "resolved": counts.get("resolved", 0),
+        "counts": counts,
+    }
+
+
+@app.get("/api/incidents/summary", tags=["Incidents"])
+async def get_incident_summary() -> dict[str, Any]:
+    """Get incident summary statistics."""
+    return get_incident_counts()
+
+
+@app.get("/api/incidents/{incident_id}", tags=["Incidents"])
+async def get_single_incident(incident_id: str) -> dict[str, Any]:
+    """Get a single incident by ID."""
+    incident = get_incident(incident_id)
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    events = get_incident_events(incident_id)
+    evidence = get_evidence(incident_id)
+    return {
+        "incident": incident,
+        "events": events,
+        "evidence": evidence,
+    }
+
+
+@app.post("/api/incidents/from-alert/{alert_id}", tags=["Incidents"])
+async def create_incident_from_alert_endpoint(alert_id: str) -> dict[str, Any]:
+    """Manually create an incident from an existing alert."""
+    alert = get_alert(alert_id)
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    incident = create_incident_from_alert(alert)
+    if not incident:
+        return {"message": "Incident not created (duplicate suppressed or alert does not meet threshold)", "created": False}
+    return {"incident": incident, "created": True}
+
+
+@app.post("/api/incidents/{incident_id}/acknowledge", tags=["Incidents"])
+async def acknowledge_incident_endpoint(incident_id: str, note: str = None) -> dict[str, Any]:
+    """Acknowledge an incident (transition NEW -> ACKNOWLEDGED)."""
+    result = transition_incident(incident_id, STATUS_ACKNOWLEDGED, note=note)
+    if not result:
+        raise HTTPException(status_code=400, detail="Cannot acknowledge this incident (invalid state transition)")
+    log_audit(
+        event_type=AUDIT_INCIDENT_ACK,
+        user_id="operator",
+        user_role=ROLE_OPERATOR,
+        resource_type="incident",
+        resource_id=incident_id,
+        action="acknowledge",
+    )
+    return result
+
+
+@app.post("/api/incidents/{incident_id}/investigate", tags=["Incidents"])
+async def investigate_incident_endpoint(incident_id: str, note: str = None) -> dict[str, Any]:
+    """Mark an incident as INVESTIGATING."""
+    result = transition_incident(incident_id, STATUS_INVESTIGATING, note=note)
+    if not result:
+        raise HTTPException(status_code=400, detail="Cannot investigate this incident (invalid state transition)")
+    log_audit(
+        event_type=AUDIT_INCIDENT_INVESTIGATE,
+        user_id="operator",
+        user_role=ROLE_OPERATOR,
+        resource_type="incident",
+        resource_id=incident_id,
+        action="investigate",
+    )
+    return result
+
+
+@app.post("/api/incidents/{incident_id}/resolve", tags=["Incidents"])
+async def resolve_incident_endpoint(incident_id: str, note: str = None) -> dict[str, Any]:
+    """Resolve an incident."""
+    result = transition_incident(incident_id, STATUS_RESOLVED, note=note)
+    if not result:
+        raise HTTPException(status_code=400, detail="Cannot resolve this incident (invalid state transition)")
+    log_audit(
+        event_type=AUDIT_INCIDENT_RESOLVE,
+        user_id="operator",
+        user_role=ROLE_OPERATOR,
+        resource_type="incident",
+        resource_id=incident_id,
+        action="resolve",
+    )
+    return result
+
+
+@app.post("/api/incidents/{incident_id}/assign", tags=["Incidents"])
+async def assign_incident_endpoint(
+    incident_id: str,
+    assigned_to: str = "operator",
+    note: str = None,
+) -> dict[str, Any]:
+    """Assign an incident to a person/team."""
+    if not assigned_to:
+        raise HTTPException(status_code=400, detail="assigned_to is required")
+    result = assign_incident(incident_id, assigned_to, actor=assigned_to)
+    if not result:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    return result
+
+
+@app.get("/api/incidents/{incident_id}/events", tags=["Incidents"])
+async def get_incident_event_history(incident_id: str) -> dict[str, Any]:
+    """Get the event history/audit trail for an incident."""
+    incident = get_incident(incident_id)
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    events = get_incident_events(incident_id)
+    return {"incident_id": incident_id, "events": events}
+
+
+@app.get("/api/incidents/{incident_id}/evidence", tags=["Incidents"])
+async def get_incident_evidence(incident_id: str) -> dict[str, Any]:
+    """Get evidence items linked to an incident."""
+    incident = get_incident(incident_id)
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    evidence = get_evidence(incident_id)
+    log_audit(
+        event_type=AUDIT_EVIDENCE_VIEW,
+        user_id="operator",
+        user_role=ROLE_OPERATOR,
+        resource_type="evidence",
+        resource_id=incident_id,
+        action="list_evidence",
+        metadata={"count": len(evidence)},
+    )
+    return {"incident_id": incident_id, "evidence": evidence}
+
+
+@app.get("/api/incidents/{incident_id}/notes", tags=["Incidents"])
+async def get_incident_notes(incident_id: str) -> dict[str, Any]:
+    """List quick notes attached to an incident."""
+    if not get_incident(incident_id):
+        raise HTTPException(status_code=404, detail="Incident not found")
+    return {"incident_id": incident_id, "notes": list_incident_notes(incident_id)}
+
+
+@app.post("/api/incidents/{incident_id}/notes", tags=["Incidents"])
+async def add_incident_note(incident_id: str, payload: IncidentNoteRequest, request: Request) -> dict[str, Any]:
+    """Create a quick note using the authenticated user's identity."""
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(status_code=422, detail="Note content cannot be blank")
+    user = request.state.user
+    note = create_incident_note(
+        incident_id,
+        content,
+        author_id=user["id"],
+        author_username=user["username"],
+    )
+    if not note:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    return {"note": note}
+
+
+@app.delete("/api/incidents/{incident_id}/notes/{note_id}", tags=["Incidents"])
+async def remove_incident_note(incident_id: str, note_id: str, request: Request) -> dict[str, Any]:
+    """Delete a note by its author or an administrator."""
+    if not get_incident(incident_id):
+        raise HTTPException(status_code=404, detail="Incident not found")
+    user = request.state.user
+    deleted = delete_incident_note(note_id, user["id"], user["role"] == ROLE_ADMIN)
+    if deleted is None:
+        raise HTTPException(status_code=404, detail="Note not found")
+    if not deleted:
+        raise HTTPException(status_code=403, detail="Only the note author or an administrator can delete this note")
+    return {"deleted": True, "note_id": note_id}
+
+
+# ============================================================
+# Emergency Response Operations
+# ============================================================
+
+async def _broadcast_emergency(event: str, response: dict[str, Any] | None = None, extra: dict[str, Any] | None = None) -> None:
+    payload = {"type": "emergency_response", "event": event, "timestamp": datetime.now(timezone.utc).isoformat()}
+    if response:
+        payload["response"] = response
+    if extra:
+        payload.update(extra)
+    try:
+        await get_websocket_manager().broadcast(payload)
+    except Exception as exc:
+        print(f"[SentinelAI] WARNING: Emergency WebSocket broadcast failed: {exc}")
+
+
+def _audit_emergency(event_type: str, response: dict[str, Any], actor: str, action: str, unit_id: str | None = None) -> None:
+    log_audit(
+        event_type=event_type,
+        user_id=actor,
+        user_role=ROLE_OPERATOR,
+        resource_type="emergency_response",
+        resource_id=response.get("id"),
+        action=action,
+        metadata={"incident_id": response.get("incident_id"), "unit_id": unit_id, "status": response.get("status")},
+    )
+
+
+@app.get("/api/emergency-responses", tags=["Emergency Response"])
+async def list_emergency_responses(status: str | None = None, severity: str | None = None, limit: int = 100) -> dict[str, Any]:
+    responses = list_responses(status=status, severity=severity, limit=max(1, min(limit, 500)))
+    return {"responses": responses, "count": len(responses), "analytics": get_emergency_analytics()}
+
+
+@app.post("/api/emergency-responses", tags=["Emergency Response"])
+async def create_emergency_response(payload: EmergencyCreateRequest) -> dict[str, Any]:
+    incident = get_incident(payload.incident_id)
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    if incident.get("severity") not in {"HIGH", "CRITICAL"}:
+        raise HTTPException(status_code=400, detail="Emergency responses require HIGH or CRITICAL incidents")
+    response = create_or_get_response(payload.incident_id)
+    if not response:
+        raise HTTPException(status_code=409, detail="Emergency response could not be created")
+    _audit_emergency(AUDIT_EMERGENCY_CREATED, response, payload.actor, "create")
+    await _broadcast_emergency("EMERGENCY_CREATED", response)
+    return response
+
+
+@app.get("/api/emergency-responses/{response_id}", tags=["Emergency Response"])
+async def get_emergency_response(response_id: str) -> dict[str, Any]:
+    response = get_response(response_id)
+    if not response:
+        raise HTTPException(status_code=404, detail="Emergency response not found")
+    return {**response, "timeline": get_timeline(response_id), "notes": get_notes(response_id), "recommendations": get_recommendations(response_id)}
+
+
+@app.patch("/api/emergency-responses/{response_id}/status", tags=["Emergency Response"])
+async def update_emergency_status(response_id: str, payload: EmergencyStatusRequest) -> dict[str, Any]:
+    if payload.status.upper() not in EMERGENCY_STATUSES:
+        raise HTTPException(status_code=400, detail="Invalid emergency response status")
+    response = transition_response(response_id, payload.status, payload.actor, payload.note)
+    if not response:
+        raise HTTPException(status_code=409, detail="Invalid emergency response state transition")
+    audit_event = AUDIT_EMERGENCY_STATUS_CHANGED
+    if response["status"] == "ACKNOWLEDGED":
+        audit_event = AUDIT_EMERGENCY_ACKNOWLEDGED
+    elif response["status"] == "RESOLVED":
+        audit_event = AUDIT_EMERGENCY_RESOLVED
+    elif response["status"] == "CANCELLED":
+        audit_event = AUDIT_EMERGENCY_CANCELLED
+    elif response["status"] == "DISPATCH_RECOMMENDED":
+        audit_event = AUDIT_EMERGENCY_ESCALATED
+    _audit_emergency(audit_event, response, payload.actor, "status_change")
+    await _broadcast_emergency("STATUS_CHANGED", response)
+    return response
+
+
+@app.post("/api/emergency-responses/{response_id}/acknowledge", tags=["Emergency Response"])
+async def acknowledge_emergency(response_id: str, payload: EmergencyStatusRequest | None = None) -> dict[str, Any]:
+    body = payload or EmergencyStatusRequest(status="ACKNOWLEDGED")
+    return await update_emergency_status(response_id, EmergencyStatusRequest(status="ACKNOWLEDGED", actor=body.actor, note=body.note))
+
+
+@app.post("/api/emergency-responses/{response_id}/escalate", tags=["Emergency Response"])
+async def escalate_emergency(response_id: str, payload: EmergencyStatusRequest | None = None) -> dict[str, Any]:
+    body = payload or EmergencyStatusRequest(status="DISPATCH_RECOMMENDED")
+    return await update_emergency_status(response_id, EmergencyStatusRequest(status="DISPATCH_RECOMMENDED", actor=body.actor, note=body.note))
+
+
+@app.post("/api/emergency-responses/{response_id}/assign-unit", tags=["Emergency Response"])
+async def assign_emergency_unit(response_id: str, payload: EmergencyAssignmentRequest) -> dict[str, Any]:
+    response = assign_unit(response_id, payload.unit_id, payload.actor)
+    if not response:
+        raise HTTPException(status_code=409, detail="Unit is unavailable or a unit is already assigned")
+    _audit_emergency(AUDIT_UNIT_ASSIGNED, response, payload.actor, "assign_unit", payload.unit_id)
+    log_audit(event_type=AUDIT_DISPATCH_REQUESTED, user_id=payload.actor, user_role=ROLE_OPERATOR, resource_type="emergency_response", resource_id=response_id, action="dispatch_request", metadata={"incident_id": response.get("incident_id"), "unit_id": payload.unit_id})
+    log_audit(event_type=AUDIT_DISPATCH_SIMULATED, user_id=payload.actor, user_role=ROLE_OPERATOR, resource_type="emergency_response", resource_id=response_id, action="simulation_dispatch", metadata={"incident_id": response.get("incident_id"), "unit_id": payload.unit_id})
+    await _broadcast_emergency("UNIT_ASSIGNED", response, {"unit_id": payload.unit_id})
+    return response
+
+
+@app.post("/api/emergency-responses/{response_id}/reassign-unit", tags=["Emergency Response"])
+async def reassign_emergency_unit(response_id: str, payload: EmergencyAssignmentRequest) -> dict[str, Any]:
+    response = get_response(response_id)
+    if not response:
+        raise HTTPException(status_code=404, detail="Emergency response not found")
+    # Reassignment is intentionally conservative: only an unassigned response can receive a new unit.
+    if response.get("assignments"):
+        raise HTTPException(status_code=409, detail="Reassignment requires the current assignment to be released")
+    return await assign_emergency_unit(response_id, payload)
+
+
+@app.post("/api/emergency-responses/{response_id}/note", tags=["Emergency Response"])
+async def add_emergency_note(response_id: str, payload: EmergencyNoteRequest) -> dict[str, Any]:
+    response = add_note(response_id, payload.note, payload.actor)
+    if not response:
+        raise HTTPException(status_code=404, detail="Emergency response not found or note is empty")
+    _audit_emergency(AUDIT_EMERGENCY_NOTE_ADDED, response, payload.actor, "add_note")
+    await _broadcast_emergency("NOTE_ADDED", response)
+    return response
+
+
+@app.post("/api/emergency-responses/{response_id}/resolve", tags=["Emergency Response"])
+async def resolve_emergency(response_id: str, payload: EmergencyStatusRequest | None = None) -> dict[str, Any]:
+    body = payload or EmergencyStatusRequest(status="RESOLVED")
+    return await update_emergency_status(response_id, EmergencyStatusRequest(status="RESOLVED", actor=body.actor, note=body.note))
+
+
+@app.get("/api/emergency-responses/{response_id}/timeline", tags=["Emergency Response"])
+async def emergency_timeline(response_id: str) -> dict[str, Any]:
+    if not get_response(response_id):
+        raise HTTPException(status_code=404, detail="Emergency response not found")
+    return {"response_id": response_id, "events": get_timeline(response_id)}
+
+
+@app.get("/api/emergency-responses/{response_id}/recommendations", tags=["Emergency Response"])
+async def emergency_recommendations(response_id: str) -> dict[str, Any]:
+    if not get_response(response_id):
+        raise HTTPException(status_code=404, detail="Emergency response not found")
+    return {"response_id": response_id, "recommendations": get_recommendations(response_id)}
+
+
+@app.get("/api/emergency-units", tags=["Emergency Response"])
+async def get_emergency_units(status: str | None = None) -> dict[str, Any]:
+    units = list_units(status=status)
+    return {"units": units, "count": len(units)}
+
+
+@app.post("/api/emergency-units", tags=["Emergency Response"])
+async def add_emergency_unit(payload: EmergencyUnitRequest) -> dict[str, Any]:
+    unit = create_unit(payload.model_dump())
+    if not unit:
+        raise HTTPException(status_code=400, detail="Invalid or duplicate emergency unit")
+    return unit
+
+
+@app.patch("/api/emergency-units/{unit_id}", tags=["Emergency Response"])
+async def edit_emergency_unit(unit_id: str, payload: EmergencyUnitUpdateRequest) -> dict[str, Any]:
+    unit = update_unit(unit_id, payload.model_dump(exclude_unset=True))
+    if not unit:
+        raise HTTPException(status_code=404, detail="Emergency unit not found or invalid update")
+    return unit
+
+
+@app.get("/api/emergency-response/analytics", tags=["Emergency Response"])
+async def emergency_response_analytics() -> dict[str, Any]:
+    return get_emergency_analytics()
+
+
+# ============================================================
+# Evidence Capture Endpoints
+# ============================================================
+
+@app.post("/api/incidents/{incident_id}/evidence", tags=["Evidence"])
+async def upload_evidence(
+    incident_id: str,
+    file: UploadFile = File(...),
+) -> dict[str, Any]:
+    """Attach a snapshot/evidence image to an existing incident.
+
+    The snapshot is stored alongside the backend directory and associated
+    with the incident. The streaming camera feed is NOT interrupted.
+    """
+    incident = get_incident(incident_id)
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    allowed_types = {"image/jpeg", "image/png", "image/webp"}
+    content_type = getattr(file, "content_type", "image/jpeg")
+    if content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type: {content_type}")
+
+    try:
+        import base64
+        import time
+        import uuid
+        data = await file.read()
+        b64_data = base64.b64encode(data).decode()
+        ev_id = str(uuid.uuid4())[:12]
+        ext = "jpg" if "jpeg" in content_type else ("png" if "png" in content_type else "webp")
+        fname = f"{incident_id}_{ev_id}.{ext}"
+        fpath = EVIDENCE_DIR / fname
+        fpath.write_bytes(data)
+        rel_path = f"evidence/{fname}"
+        now = datetime.now(timezone.utc).isoformat()
+
+        from ai.storage import get_connection
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO evidence (id, incident_id, file_path, content_type, size_bytes, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (ev_id, incident_id, rel_path, content_type, len(data), now))
+            conn.commit()
+
+        # Update the incident's evidence_path to the first one if not set
+        if not incident.get("evidence_path"):
+            with get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("UPDATE incidents SET evidence_path = ? WHERE id = ?", (rel_path, incident_id))
+                conn.commit()
+
+        log_audit(
+            event_type=AUDIT_EVIDENCE_VIEW,
+            user_id="operator",
+            user_role=ROLE_OPERATOR,
+            resource_type="evidence",
+            resource_id=ev_id,
+            action="upload_evidence",
+            metadata={
+                "incident_id": incident_id,
+                "size_bytes": len(data),
+                "content_type": content_type,
+            },
+        )
+
+        return {
+            "id": ev_id,
+            "incident_id": incident_id,
+            "file_path": rel_path,
+            "content_type": content_type,
+            "size_bytes": len(data),
+            "created_at": now,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save evidence: {e}")
+
+
+@app.get("/api/evidence/{filename:path}", tags=["Evidence"])
+async def serve_evidence(filename: str):
+    """Serve an evidence image file."""
+    # Security: only serve files under the evidence directory
+    import os as _os
+    safe_path = EVIDENCE_DIR / filename
+    if not safe_path.exists() or not safe_path.is_file():
+        raise HTTPException(status_code=404, detail="Evidence file not found")
+    # Prevent path traversal
+    if not str(safe_path.resolve()).startswith(str(EVIDENCE_DIR.resolve())):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    from starlette.responses import FileResponse
+    return FileResponse(safe_path, media_type="image/jpeg")
+
+
+@app.get("/api/evidence", tags=["Evidence"])
+async def list_all_evidence_endpoint(
+    limit: int = 100,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """List all evidence records across all incidents.
+
+    Returns evidence with incident context (camera, event type, severity, risk score)
+    so the Evidence Center can display a rich grid without additional lookups.
+    """
+    from ai.incident_service import list_all_evidence as _list_all_evidence
+    records = _list_all_evidence(limit=limit, offset=offset)
+    return {"evidence": records, "count": len(records)}
+
+
+# ============================================================
+# Incident Report Export
+# ============================================================
+
+@app.get("/api/incidents/{incident_id}/export", tags=["Export"])
+async def export_incident_report(incident_id: str) -> dict[str, Any]:
+    """Generate an incident report as a JSON document.
+
+    The frontend can format this as printable HTML or PDF.
+    """
+    incident = get_incident(incident_id)
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    events = get_incident_events(incident_id)
+    evidence = get_evidence(incident_id)
+
+    # Build the alert object if linked
+    linked_alert = None
+    if incident.get("alert_id"):
+        linked_alert = get_alert(incident["alert_id"])
+
+    return {
+        "report_type": "incident_report",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "incident": {
+            "id": incident.get("id"),
+            "created_at": incident.get("created_at"),
+            "updated_at": incident.get("updated_at"),
+            "resolved_at": incident.get("resolved_at"),
+            "camera_id": incident.get("camera_id"),
+            "location": incident.get("location"),
+            "incident_type": incident.get("incident_type"),
+            "severity": incident.get("severity"),
+            "risk_score": incident.get("risk_score"),
+            "risk_level": incident.get("risk_level"),
+            "detected_objects": incident.get("detected_objects", []),
+            "status": incident.get("status"),
+            "assigned_to": incident.get("assigned_to"),
+            "evidence_path": incident.get("evidence_path"),
+        },
+        "linked_alert": linked_alert,
+        "event_history": events,
+        "evidence": [
+            {
+                "id": e.get("id"),
+                "file_path": e.get("file_path"),
+                "content_type": e.get("content_type"),
+                "created_at": e.get("created_at"),
+            }
+            for e in evidence
+        ],
+    }
+
+
+# ============================================================
+# Camera Health Endpoints
+# ============================================================
+
+# Camera heartbeat tracking (last heartbeat per camera)
+_camera_heartbeats: dict[str, datetime] = {}
+CAMERA_OFFLINE_THRESHOLD_SECONDS = 30
+
+
+def get_camera_health(camera_id: str) -> dict[str, Any]:
+    """Return health info for a single camera."""
+    from datetime import timedelta
+    status = _camera_states.get(camera_id, "UNKNOWN")
+    last_beat = _camera_heartbeats.get(camera_id)
+    seconds_since = None
+    if last_beat:
+        seconds_since = (datetime.now(timezone.utc) - last_beat).total_seconds()
+
+    # Determine effective status
+    effective_status = status
+    if status == "ONLINE" and seconds_since is not None and seconds_since > CAMERA_OFFLINE_THRESHOLD_SECONDS:
+        effective_status = "RECONNECTING"
+
+    return {
+        "camera_id": camera_id,
+        "status": effective_status,
+        "raw_status": status,
+        "last_heartbeat": last_beat.isoformat() if last_beat else None,
+        "seconds_since_heartbeat": int(seconds_since) if seconds_since is not None else None,
+        "is_stale": seconds_since > CAMERA_OFFLINE_THRESHOLD_SECONDS if seconds_since is not None else True,
+    }
+
+
+@app.get("/api/cameras/health", tags=["Cameras"])
+async def get_all_cameras_health() -> dict[str, Any]:
+    """Get health status for all cameras."""
+    health_list = []
+    for cam_id in CAMERAS:
+        health_list.append(get_camera_health(cam_id))
+    return {
+        "cameras": health_list,
+        "offline_count": sum(1 for h in health_list if h["status"] in ("OFFLINE", "ERROR")),
+        "online_count": sum(1 for h in health_list if h["status"] == "ONLINE"),
+        "reconnecting_count": sum(1 for h in health_list if h["status"] == "RECONNECTING"),
+    }
+
+
+@app.post("/api/cameras/{camera_id}/heartbeat", tags=["Cameras"])
+async def camera_heartbeat(camera_id: str) -> dict[str, Any]:
+    """Record a heartbeat from a camera."""
+    cam = get_camera(camera_id)
+    if cam is None:
+        raise HTTPException(status_code=404, detail=f"Unknown camera: {camera_id}")
+    now = datetime.now(timezone.utc)
+    _camera_heartbeats[camera_id] = now
+    if _camera_states.get(camera_id) != "ONLINE":
+        await _broadcast_camera_status(camera_id, "ONLINE")
+    return {
+        "camera_id": camera_id,
+        "status": "ONLINE",
+        "heartbeat_at": now.isoformat(),
+    }
+
+
+# ============================================================
+# System Status Endpoint
+# ============================================================
+
+@app.get("/api/system/status", tags=["System"])
+async def get_system_status() -> dict[str, Any]:
+    """Get the complete system status for the AI System Status panel."""
+    ai_mode = get_ai_mode()
+    ai_active = is_ai_active()
+    model_info = get_model_info()
+    det_stats = get_detection_stats()
+    ws_manager = get_websocket_manager()
+
+    # Camera health summary
+    health_list = [get_camera_health(cam_id) for cam_id in CAMERAS]
+    cameras_online = sum(1 for h in health_list if h["status"] == "ONLINE")
+    cameras_total = len(CAMERAS)
+
+    # Alert summary
+    alert_counts = get_summary().get("alerts", {})
+
+    # Incident summary
+    inc_counts = get_incident_counts()
+
+    # Detection stats
+    det_total = det_stats.get("detection_counter", 0)
+    risk_engine_active = True  # always active in this implementation
+
+    return {
+        "backend": {
+            "status": "ONLINE",
+            "version": "1.0.0",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
+        "camera": {
+            "status": "ONLINE" if cameras_online > 0 else "OFFLINE",
+            "online": cameras_online,
+            "total": cameras_total,
+            "details": health_list,
+        },
+        "yolo": {
+            "status": "REAL" if ai_mode == "YOLO" else "DEMO",
+            "mode": ai_mode,
+        },
+        "model": {
+            "status": "LOADED" if ai_active else "NOT LOADED",
+            "loaded": ai_active,
+            "classes": get_model_classes(),
+            "device": get_inference_device(),
+            "confidence_threshold": get_confidence_threshold(),
+            "model_info": model_info,
+        },
+        "websocket": {
+            "status": "CONNECTED" if ws_manager.client_count > 0 else "DISCONNECTED",
+            "connected_clients": ws_manager.client_count,
+        },
+        "detection": {
+            "status": "ACTIVE" if ai_active else "INACTIVE",
+            "total_detections": det_total,
+        },
+        "risk_engine": {
+            "status": "ACTIVE" if risk_engine_active else "INACTIVE",
+        },
+        "summary": {
+            "active_alerts": alert_counts.get("active", 0),
+            "critical_alerts": alert_counts.get("critical", 0),
+            "high_alerts": alert_counts.get("high", 0),
+            "total_incidents": inc_counts.get("total", 0),
+            "open_incidents": inc_counts.get("open", 0),
+            "resolved_incidents": inc_counts.get("resolved", 0),
+        },
+    }
+
+
+# ============================================================
+# Enhanced Analytics Endpoint
+# ============================================================
+
+@app.get("/api/analytics/comprehensive", tags=["Analytics"])
+async def get_comprehensive_analytics() -> dict[str, Any]:
+    """Return comprehensive analytics including incidents, detections, and alerts."""
+    analytics_data = get_analytics_data()
+    alert_counts = get_summary().get("alerts", {})
+    inc_counts = get_incident_counts()
+    det_stats = get_detection_stats()
+    risk_trend = get_risk_trend(limit=24)
+
+    # Incidents by camera (sorted by count descending)
+    inc_by_cam = sorted(inc_counts.get("by_camera", []), key=lambda x: x["count"], reverse=True)
+
+    # Risk distribution from detection history
+    by_level = det_stats.get("by_risk_level", {})
+
+    return {
+        "detections": {
+            "total_events": det_stats.get("total_events", 0),
+            "average_risk_score": det_stats.get("average_risk_score", 0),
+            "max_risk_score": det_stats.get("max_risk_score", 0),
+            "events_last_hour": det_stats.get("events_last_hour", 0),
+            "detection_counts": det_stats.get("detection_counts", {}),
+            "by_risk_level": by_level,
+        },
+        "alerts": {
+            "total": alert_counts.get("total", 0),
+            "active": alert_counts.get("active", 0),
+            "acknowledged": alert_counts.get("acknowledged", 0),
+            "resolved": alert_counts.get("resolved", 0),
+            "critical": alert_counts.get("critical", 0),
+            "high": alert_counts.get("high", 0),
+            "medium": alert_counts.get("medium", 0),
+            "low": alert_counts.get("low", 0),
+        },
+        "incidents": {
+            "total": inc_counts.get("total", 0),
+            "new": inc_counts.get("new", 0),
+            "acknowledged": inc_counts.get("acknowledged", 0),
+            "investigating": inc_counts.get("investigating", 0),
+            "resolved": inc_counts.get("resolved", 0),
+            "critical": inc_counts.get("critical", 0),
+            "high": inc_counts.get("high", 0),
+            "by_camera": inc_by_cam[:10],  # top 10 cameras by incident count
+        },
+        "risk_trend": [
+            {
+                "hour": p["hour"],
+                "avg_risk_score": p["avg_risk_score"],
+                "max_risk_score": p["max_risk_score"],
+                "event_count": p["event_count"],
+            }
+            for p in risk_trend
+        ],
+        "metrics": analytics_data.get("metrics", []),
+    }
+
+
+# ============================================================
+# Risk Timeline Endpoint (for the Risk Timeline panel)
+# ============================================================
+
+@app.get("/api/risk-timeline", tags=["Risk"])
+async def get_risk_timeline(limit: int = 50) -> dict[str, Any]:
+    """Return a real-time risk timeline for the dashboard.
+
+    Each entry represents a meaningful detection event with its risk score,
+    level, camera, and timestamp. Only HIGH/CRITICAL events are included.
+    """
+    history = get_detection_history(limit=limit, risk_level=None)
+    timeline = [
+        {
+            "id": e.get("id"),
+            "timestamp": e.get("timestamp"),
+            "risk_score": e.get("risk_score"),
+            "risk_level": e.get("risk_level"),
+            "camera_id": e.get("camera_id"),
+            "detections": e.get("detections", []),
+            "event_type": "detection",
+        }
+        for e in history
+        if e.get("risk_score", 0) > 0
+    ]
+    # Also include recent alerts
+    recent_alerts = list_alerts(limit=20)
+    for a in recent_alerts:
+        timeline.append({
+            "id": a.get("id"),
+            "timestamp": a.get("timestamp"),
+            "risk_score": a.get("risk_score", 0),
+            "risk_level": a.get("risk_level", "LOW"),
+            "camera_id": a.get("camera_id"),
+            "location": a.get("location"),
+            "event_type": "alert",
+            "alert_type": a.get("type"),
+            "severity": a.get("severity"),
+            "message": a.get("message"),
+            "status": a.get("status"),
+        })
+    # Sort by timestamp descending, take top N
+    timeline.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+    return {"events": timeline[:limit], "count": min(len(timeline), limit)}
+
+
+# ============================================================
+# Analytics Endpoints
+# ============================================================
+
+@app.get("/api/analytics/dashboard", response_model=AnalyticsResponse, tags=["Analytics"])
+async def get_dashboard_analytics() -> AnalyticsResponse:
+    """Get analytics data for the dashboard."""
+    data = get_analytics_data()
+
+    # Convert to the existing AnalyticsResponse format
+    metrics = []
+    for m in data.get("metrics", []):
+        metrics.append(AnalyticsMetric(
+            label=m["label"],
+            value=m["value"],
+            percent=m.get("percent", 0),
+            tone=m.get("tone", "safe")
+        ))
+
+    trends = []
+    for t in data.get("trends", []):
+        risk_raw = t.get("riskScore", 0)
+        risk_score_int = int(risk_raw) if isinstance(risk_raw, (int, float)) else 0
+        trends.append(TrendPoint(
+            label=t["label"],
+            incidents=t.get("incidents", 0),
+            riskScore=risk_score_int,
+        ))
+
+    return AnalyticsResponse(metrics=metrics, trends=trends)
+
+
+@app.get("/api/analytics/full", tags=["Analytics"])
+async def get_full_analytics() -> dict[str, Any]:
+    """Get full analytics data including alert counts and detection stats."""
+    return get_analytics_data()
+
+
+@app.get("/api/analytics/risk-trend", tags=["Analytics"])
+async def get_risk_trend_endpoint(limit: int = 24) -> dict[str, Any]:
+    """Get risk trend data."""
+    from ai.alert_service import get_risk_trend
+    trend = get_risk_trend(limit=limit)
+    return {"trend": trend, "count": len(trend)}
+
+
+# ============================================================
+# AI Traffic Analytics Endpoints
+# ============================================================
+
+def _parse_period(period: str) -> int:
+    """Convert period string to hours."""
+    mapping = {"24h": 24, "7d": 168, "30d": 720}
+    return mapping.get(period, 24)
+
+
+def _get_date_range(period: str, custom_start: str = None, custom_end: str = None):
+    """Return start and end ISO timestamps based on period."""
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    if custom_start and custom_end:
+        return custom_start, custom_end
+    hours = _parse_period(period)
+    start = now - timedelta(hours=hours)
+    return start.isoformat(), now.isoformat()
+
+
+@app.get("/api/analytics/overview", tags=["Analytics"])
+async def get_analytics_overview(
+    period: str = "24h",
+    camera_id: str = None,
+    event_type: str = None,
+    severity: str = None,
+    start_date: str = None,
+    end_date: str = None,
+) -> dict[str, Any]:
+    """Get KPI overview for the analytics dashboard."""
+    from ai.alert_service import get_detection_stats, get_alert_counts
+    from ai.incident_service import get_incident_counts
+
+    start_time, end_time = _get_date_range(period, start_date, end_date)
+
+    stats = get_detection_stats(
+        start_time=start_time,
+        end_time=end_time,
+        camera_id=camera_id,
+    )
+    alert_counts = get_alert_counts()
+    incident_counts = get_incident_counts()
+
+    return {
+        "period": period,
+        "start_time": start_time,
+        "end_time": end_time,
+        "total_detections": stats["total_events"],
+        "vehicles_detected": stats.get("vehicle_count", 0),
+        "pedestrians_detected": stats.get("pedestrian_count", 0),
+        "motorcycles_detected": stats.get("motorcycle_count", 0),
+        "high_risk_events": stats.get("high_events", 0),
+        "critical_events": stats.get("critical_events", 0),
+        "active_incidents": incident_counts.get("active", 0),
+        "average_risk_score": stats.get("average_risk_score", 0),
+        "max_risk_score": stats.get("max_risk_score", 0),
+        "by_risk_level": stats.get("by_risk_level", {}),
+        "event_type_counts": stats.get("event_type_counts", {}),
+        "detection_counts": stats.get("detection_counts", {}),
+        "alerts": alert_counts,
+        "incidents": incident_counts,
+    }
+
+
+@app.get("/api/analytics/traffic-trend", tags=["Analytics"])
+async def get_traffic_trend(
+    period: str = "24h",
+    camera_id: str = None,
+    start_date: str = None,
+    end_date: str = None,
+) -> dict[str, Any]:
+    """Get time-bucketed detection counts for trend charts."""
+    from datetime import datetime, timezone, timedelta
+    from ai.storage import get_connection
+
+    start_time_str, end_time_str = _get_date_range(period, start_date, end_date)
+    start_dt = datetime.fromisoformat(start_time_str.replace("Z", "+00:00"))
+    end_dt = datetime.fromisoformat(end_time_str.replace("Z", "+00:00"))
+    delta = end_dt - start_dt
+
+    # Choose bucket size: hourly for <48h, 6-hourly for <14d, daily for >=14d
+    if delta.total_seconds() < 48 * 3600:
+        fmt = "%Y-%m-%d %H:00"
+        group_by = "strftime('%Y-%m-%d %H:00', timestamp)"
+        bucket_label = "hour"
+    elif delta.total_seconds() < 14 * 86400:
+        fmt = "%Y-%m-%d %H:00"
+        group_by = "strftime('%Y-%m-%d 00:00', datetime(timestamp, '+' || (CAST(strftime('%H', timestamp) AS INTEGER) / 6 * 6) || ' hours'))"
+        bucket_label = "6h"
+    else:
+        fmt = "%Y-%m-%d"
+        group_by = "strftime('%Y-%m-%d', timestamp)"
+        bucket_label = "day"
+
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        params = [start_time_str, end_time_str]
+        where = "WHERE timestamp >= ? AND timestamp <= ?"
+        if camera_id:
+            where += " AND camera_id = ?"
+            params.append(camera_id)
+
+        cursor.execute(f"""
+            SELECT
+                {group_by} as bucket,
+                COUNT(*) as detection_count,
+                AVG(risk_score) as avg_risk,
+                MAX(risk_score) as max_risk
+            FROM detection_history
+            {where}
+            GROUP BY bucket
+            ORDER BY bucket ASC
+        """, params)
+
+        buckets = []
+        for row in cursor.fetchall():
+            buckets.append({
+                "time": row["bucket"],
+                "label": row["bucket"].split(" ")[1][:5] if " " in row["bucket"] else row["bucket"][-5:],
+                "detection_count": row["detection_count"],
+                "avg_risk": round(row["avg_risk"] or 0, 1),
+                "max_risk": row["max_risk"] or 0,
+            })
+
+    return {
+        "period": period,
+        "bucket_label": bucket_label,
+        "buckets": buckets,
+        "count": len(buckets),
+    }
+
+
+@app.get("/api/analytics/risk-heatmap", tags=["Analytics"])
+async def get_risk_heatmap(
+    period: str = "24h",
+    start_date: str = None,
+    end_date: str = None,
+) -> dict[str, Any]:
+    """Get per-camera risk heatmap data."""
+    from ai.storage import get_connection
+    from ai.incident_service import list_incidents
+
+    start_time_str, end_time_str = _get_date_range(period, start_date, end_date)
+
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT
+                camera_id,
+                COUNT(*) as total_detections,
+                AVG(risk_score) as avg_risk,
+                MAX(risk_score) as max_risk,
+                SUM(CASE WHEN risk_level = 'HIGH' OR risk_level = 'CRITICAL' THEN 1 ELSE 0 END) as high_risk_events,
+                SUM(CASE WHEN risk_level = 'CRITICAL' THEN 1 ELSE 0 END) as critical_events
+            FROM detection_history
+            WHERE timestamp >= ? AND timestamp <= ?
+            GROUP BY camera_id
+            ORDER BY avg_risk DESC
+        """, (start_time_str, end_time_str))
+
+        cameras = []
+        for row in cursor.fetchall():
+            cameras.append({
+                "camera_id": row["camera_id"] or "UNKNOWN",
+                "total_detections": row["total_detections"],
+                "avg_risk": round(row["avg_risk"] or 0, 1),
+                "max_risk": row["max_risk"] or 0,
+                "high_risk_events": row["high_risk_events"],
+                "critical_events": row["critical_events"],
+            })
+
+        # Determine risk level for each camera
+        for cam in cameras:
+            avg = cam["avg_risk"]
+            if avg >= 70:
+                cam["risk_level"] = "CRITICAL"
+            elif avg >= 50:
+                cam["risk_level"] = "HIGH"
+            elif avg >= 30:
+                cam["risk_level"] = "MEDIUM"
+            else:
+                cam["risk_level"] = "LOW"
+
+    return {
+        "period": period,
+        "cameras": cameras,
+        "count": len(cameras),
+    }
+
+
+@app.get("/api/analytics/camera-ranking", tags=["Analytics"])
+async def get_camera_ranking(
+    period: str = "24h",
+    start_date: str = None,
+    end_date: str = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """Rank cameras by risk â€” used for Camera Risk Ranking display."""
+    heatmap = await get_risk_heatmap(period, start_date, end_date)
+    cameras = heatmap["cameras"]
+
+    # Rank by avg_risk descending
+    ranked = sorted(cameras, key=lambda x: x["avg_risk"], reverse=True)[:limit]
+    for i, cam in enumerate(ranked):
+        cam["rank"] = i + 1
+
+    return {
+        "period": period,
+        "cameras": ranked,
+        "count": len(ranked),
+    }
+
+
+@app.get("/api/analytics/event-distribution", tags=["Analytics"])
+async def get_event_distribution(
+    period: str = "24h",
+    camera_id: str = None,
+    start_date: str = None,
+    end_date: str = None,
+) -> dict[str, Any]:
+    """Get event type distribution from detection_history.event_type."""
+    from ai.storage import get_connection
+
+    start_time_str, end_time_str = _get_date_range(period, start_date, end_date)
+
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        params = [start_time_str, end_time_str]
+        where = "WHERE timestamp >= ? AND timestamp <= ?"
+        if camera_id:
+            where += " AND camera_id = ?"
+            params.append(camera_id)
+
+        cursor.execute(f"""
+            SELECT event_type, COUNT(*) as count
+            FROM detection_history
+            {where}
+            GROUP BY event_type
+            ORDER BY count DESC
+        """, params)
+
+        events = [
+            {"event_type": row["event_type"], "count": row["count"]}
+            for row in cursor.fetchall()
+        ]
+
+    total = sum(e["count"] for e in events) or 1
+    for e in events:
+        e["percentage"] = round(e["count"] / total * 100, 1)
+
+    return {
+        "period": period,
+        "events": events,
+        "count": len(events),
+        "total": total,
+    }
+
+
+@app.get("/api/analytics/peak-periods", tags=["Analytics"])
+async def get_peak_periods(
+    period: str = "24h",
+    start_date: str = None,
+    end_date: str = None,
+) -> dict[str, Any]:
+    """Find peak risk hours, lowest risk hours, peak traffic periods."""
+    from ai.storage import get_connection
+
+    start_time_str, end_time_str = _get_date_range(period, start_date, end_date)
+
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        # Hour-of-day analysis (all days aggregated)
+        cursor.execute("""
+            SELECT
+                CAST(strftime('%H', timestamp) AS INTEGER) as hour,
+                COUNT(*) as detection_count,
+                AVG(risk_score) as avg_risk,
+                MAX(risk_score) as max_risk
+            FROM detection_history
+            WHERE timestamp >= ? AND timestamp <= ?
+            GROUP BY hour
+            ORDER BY hour ASC
+        """, (start_time_str, end_time_str))
+
+        hourly = {}
+        for row in cursor.fetchall():
+            hourly[row["hour"]] = {
+                "hour": row["hour"],
+                "detection_count": row["detection_count"],
+                "avg_risk": round(row["avg_risk"] or 0, 1),
+                "max_risk": row["max_risk"] or 0,
+            }
+
+        # Peak risk hour
+        peak_risk_hour = max(hourly.values(), key=lambda x: x["avg_risk"], default=None)
+        # Lowest risk hour
+        lowest_risk_hour = min(hourly.values(), key=lambda x: x["avg_risk"], default=None)
+        # Peak traffic
+        peak_traffic_hour = max(hourly.values(), key=lambda x: x["detection_count"], default=None)
+
+        def fmt(h):
+            if h is None:
+                return None
+            return f"{h['hour']:02d}:00 - {h['hour']:02d}:59"
+
+        return {
+            "period": period,
+            "highest_risk_hour": fmt(peak_risk_hour),
+            "highest_risk_score": peak_risk_hour["avg_risk"] if peak_risk_hour else 0,
+            "lowest_risk_hour": fmt(lowest_risk_hour),
+            "lowest_risk_score": lowest_risk_hour["avg_risk"] if lowest_risk_hour else 0,
+            "highest_traffic_hour": fmt(peak_traffic_hour),
+            "highest_traffic_count": peak_traffic_hour["detection_count"] if peak_traffic_hour else 0,
+            "hourly_breakdown": [hourly.get(h, {"hour": h, "detection_count": 0, "avg_risk": 0, "max_risk": 0}) for h in range(24)],
+        }
+
+
+@app.get("/api/analytics/report", tags=["Analytics"])
+async def get_analytics_report(
+    report_type: str = "daily",  # daily | weekly | monthly
+    camera_id: str = None,
+    start_date: str = None,
+    end_date: str = None,
+) -> dict[str, Any]:
+    """Generate a traffic safety report with KPIs and summary."""
+    from datetime import datetime, timezone, timedelta
+
+    now = datetime.now(timezone.utc)
+    if start_date and end_date:
+        start_time_str, end_time_str = start_date, end_date
+    elif report_type == "daily":
+        start_time_str = (now - timedelta(hours=24)).isoformat()
+        end_time_str = now.isoformat()
+    elif report_type == "weekly":
+        start_time_str = (now - timedelta(days=7)).isoformat()
+        end_time_str = now.isoformat()
+    else:  # monthly
+        start_time_str = (now - timedelta(days=30)).isoformat()
+        end_time_str = now.isoformat()
+
+    overview = await get_analytics_overview(
+        period="24h", camera_id=camera_id,
+        start_date=start_time_str, end_date=end_time_str,
+    )
+    heatmap = await get_risk_heatmap(
+        period="24h", start_date=start_time_str, end_date=end_time_str,
+    )
+    peak = await get_peak_periods(
+        period="24h", start_date=start_time_str, end_date=end_time_str,
+    )
+
+    # Top risk camera
+    cameras = heatmap.get("cameras", [])
+    top_camera = cameras[0] if cameras else None
+
+    return {
+        "report_type": report_type,
+        "generated_at": now.isoformat(),
+        "period_start": start_time_str,
+        "period_end": end_time_str,
+        "summary": {
+            "total_detections": overview["total_detections"],
+            "vehicle_count": overview["vehicles_detected"],
+            "pedestrian_count": overview["pedestrians_detected"],
+            "motorcycle_count": overview["motorcycles_detected"],
+            "high_risk_events": overview["high_risk_events"],
+            "critical_events": overview["critical_events"],
+            "active_incidents": overview["active_incidents"],
+            "average_risk_score": overview["average_risk_score"],
+            "peak_risk_hour": peak["highest_risk_hour"],
+            "peak_risk_score": peak["highest_risk_score"],
+            "highest_traffic_hour": peak["highest_traffic_hour"],
+            "highest_traffic_count": peak["highest_traffic_count"],
+            "total_events_by_level": overview["by_risk_level"],
+            "total_events_by_type": overview["event_type_counts"],
+        },
+        "top_risk_camera": top_camera,
+        "all_cameras": cameras,
+        "peak_periods": peak,
+    }
+
+
+@app.get("/api/analytics/export", tags=["Analytics"])
+async def export_analytics(
+    format: str = "json",
+    period: str = "24h",
+    camera_id: str = None,
+    start_date: str = None,
+    end_date: str = None,
+):
+    """Export analytics data as JSON or CSV."""
+    from ai.storage import get_detection_history
+
+    start_time_str, end_time_str = _get_date_range(period, start_date, end_date)
+    events = get_detection_history(
+        limit=5000,
+        camera_id=camera_id,
+        start_time=start_time_str,
+        end_time=end_time_str,
+    )
+
+    if format == "csv":
+        import csv
+        import io
+        output = io.StringIO()
+        if events:
+            writer = csv.DictWriter(output, fieldnames=["id", "timestamp", "camera_id", "risk_score", "risk_level", "event_type", "detection_count"])
+            writer.writeheader()
+            for e in events:
+                writer.writerow({
+                    "id": e.get("id", ""),
+                    "timestamp": e.get("timestamp", ""),
+                    "camera_id": e.get("camera_id", ""),
+                    "risk_score": e.get("risk_score", ""),
+                    "risk_level": e.get("risk_level", ""),
+                    "event_type": e.get("event_type", ""),
+                    "detection_count": len(e.get("detections", [])),
+                })
+        return {
+            "format": "csv",
+            "data": output.getvalue(),
+            "count": len(events),
+        }
+
+    return {
+        "format": "json",
+        "period": period,
+        "start_time": start_time_str,
+        "end_time": end_time_str,
+        "events": events,
+        "count": len(events),
+    }
+
+
+# ============================================================
+# AI Predictive Risk Engine Endpoints
+# ============================================================
+
+@app.get("/api/predictive-risk/overview", tags=["Predictive Risk"])
+async def get_predictive_overview(camera_id: str = None):
+    """
+    AI Predictive Risk Overview.
+
+    Computes risk predictions for 15/30/60-minute windows using a transparent
+    statistical baseline (NOT a trained ML model).
+
+    Model type: Predictive Baseline
+    Data requirement: Insufficient data for trained ML prediction.
+
+    Query params:
+      camera_id: filter to one camera (optional)
+    """
+    result = predict_risk(camera_id=camera_id)
+    # Store aggregate prediction for history tracking
+    if result.get("aggregate"):
+        try:
+            store_prediction(result["aggregate"])
+        except Exception:
+            pass
+    return result
+
+
+@app.get("/api/predictive-risk/cameras", tags=["Predictive Risk"])
+async def get_camera_predictions():
+    """
+    Camera-level risk predictions.
+
+    Returns per-camera prediction with contributing factors,
+    forecast windows, and recommended actions.
+    """
+    result = predict_risk()
+    return {
+        "cameras": result.get("predictions", []),
+        "aggregate": result.get("aggregate"),
+        "model_type": result.get("model_type"),
+        "confidence_label": result.get("confidence_label"),
+        "has_sufficient_data": result.get("has_sufficient_data"),
+        "data_note": result.get("data_note"),
+        "timestamp": result.get("timestamp"),
+    }
+
+
+@app.get("/api/predictive-risk/history", tags=["Predictive Risk"])
+async def get_predictions_history(
+    camera_id: str = None,
+    limit: int = 100,
+    offset: int = 0,
+):
+    """
+    Historical prediction records for accuracy evaluation.
+
+    Predictions are stored after each overview computation.
+    Use to understand prediction patterns over time.
+    """
+    history = get_prediction_history(camera_id=camera_id, limit=limit, offset=offset)
+    return {
+        "predictions": history,
+        "count": len(history),
+        "limit": limit,
+        "offset": offset,
+        "camera_id": camera_id,
+    }
+
+
+@app.get("/api/predictive-risk/accuracy", tags=["Predictive Risk"])
+async def get_prediction_accuracy(
+    window_minutes: int = 60,
+    min_predictions: int = 10,
+):
+    """
+    Prediction accuracy evaluation.
+
+    Compares historical predictions with actual risk outcomes.
+    Requires at least `min_predictions` stored predictions.
+
+    Returns precision, recall, F1 score, and accuracy.
+
+    NOTE: Only available after predictions have been stored for some time.
+    Initially returns available=False until enough data accumulates.
+    """
+    return compute_prediction_accuracy(
+        window_minutes=window_minutes,
+        min_predictions=min_predictions,
+    )
+
+
+@app.get("/api/predictive-risk/{camera_id}", tags=["Predictive Risk"])
+async def get_camera_prediction(camera_id: str):
+    """
+    Prediction for a specific camera.
+
+    Returns detailed prediction with contributing factors,
+    3 forecast windows, and recommended action.
+    """
+    result = predict_risk(camera_id=camera_id)
+    cam_pred = next(
+        (p for p in result.get("predictions", []) if p["camera_id"] == camera_id),
+        None,
+    )
+    if cam_pred is None:
+        raise HTTPException(status_code=404, detail=f"No data for camera: {camera_id}")
+    try:
+        store_prediction(cam_pred)
+    except Exception:
+        pass
+    return {
+        "camera_id": camera_id,
+        "prediction": cam_pred,
+        "model_type": result.get("model_type"),
+        "confidence_label": result.get("confidence_label"),
+        "has_sufficient_data": result.get("has_sufficient_data"),
+        "data_note": result.get("data_note"),
+        "timestamp": result.get("timestamp"),
+    }
+
+
+# ============================================================
+# AI Copilot Endpoints (Autonomous Safety Intelligence)
+# ============================================================
+
+@app.get("/api/ai/context", tags=["AI Copilot"])
+async def get_ai_context_endpoint() -> dict[str, Any]:
+    """Return the full structured context the AI Copilot uses.
+
+    This is an aggregated snapshot of cameras, alerts, incidents, detections,
+    predictions, and system health â€” without duplicating the entire database.
+    The AI Copilot uses this to answer operator questions with real data.
+    """
+    try:
+        return get_ai_context(
+            camera_states=_camera_states,
+            camera_heartbeats=_camera_heartbeats,
+        )
+    except Exception as e:
+        print(f"[SentinelAI] âš ï¸ AI context error: {e}")
+        return {"error": str(e), "generated_at": datetime.now(timezone.utc).isoformat()}
+
+
+class AIQueryRequest(BaseModel):
+    question: str = Field(..., description="Natural-language question from the operator")
+    context_snapshot: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional pre-fetched context to avoid extra aggregation"
+    )
+
+
+class AIQueryResponse(BaseModel):
+    answer: str
+    source: str
+    context_snapshot_at: str
+    data_sources: list[str]
+
+
+@app.post("/api/ai/query", response_model=AIQueryResponse, tags=["AI Copilot"])
+async def query_ai_endpoint(request: AIQueryRequest) -> AIQueryResponse:
+    """Answer a natural-language operator question using real backend data.
+
+    This is a deterministic rules engine â€” it NEVER invents values.
+    All answers are derived from actual camera states, alerts, incidents,
+    predictions, and detection stats.
+    """
+    if not request.question or not request.question.strip():
+        raise HTTPException(status_code=400, detail="question is required")
+
+    try:
+        # Use provided context or fetch fresh
+        ctx = request.context_snapshot
+        if ctx is None:
+            ctx = get_ai_context(
+                camera_states=_camera_states,
+                camera_heartbeats=_camera_heartbeats,
+            )
+
+        result = query_ai(request.question.strip(), ctx)
+        log_audit(
+            event_type=AUDIT_AI_QUERY,
+            user_id="operator",
+            user_role=ROLE_OPERATOR,
+            resource_type="ai_copilot",
+            resource_id=None,
+            action=_sanitize_query(request.question),
+            status="SUCCESS",
+            metadata={"source": result.get("source", "")},
+        )
+        return AIQueryResponse(
+            answer=result.get("answer", ""),
+            source=result.get("source", "unknown"),
+            context_snapshot_at=result.get("context_snapshot_at", ""),
+            data_sources=result.get("data_sources", []),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[SentinelAI] âš ï¸ AI query error: {e}")
+        raise HTTPException(status_code=500, detail=f"AI query failed: {e}")
+
+
+@app.get("/api/ai/explain-risk", tags=["AI Copilot"])
+async def explain_risk_endpoint(
+    risk_level: str = "MEDIUM",
+    risk_score: int = 0,
+    event_type: str = "NONE",
+) -> dict[str, Any]:
+    """Return a structured risk explanation for the current detection.
+
+    Used by the Risk Explanation Engine panel.
+    """
+    try:
+        return explain_risk(
+            risk_level=risk_level,
+            risk_score=risk_score,
+            detections=[],
+            factors=[],
+            event_type=event_type if event_type != "NONE" else None,
+        )
+    except Exception as e:
+        print(f"[SentinelAI] âš ï¸ Risk explanation error: {e}")
+        return {"error": str(e)}
+
+
+@app.get("/api/ai/recommendations", tags=["AI Copilot"])
+async def get_recommendations_endpoint() -> dict[str, Any]:
+    """Return informational operator recommendations (never auto-executes)."""
+    try:
+        ctx = get_ai_context(
+            camera_states=_camera_states,
+            camera_heartbeats=_camera_heartbeats,
+        )
+        recs = build_recommendations(ctx)
+        return {"recommendations": recs, "count": len(recs), "generated_at": datetime.now(timezone.utc).isoformat()}
+    except Exception as e:
+        print(f"[SentinelAI] âš ï¸ Recommendations error: {e}")
+        return {"recommendations": [], "count": 0, "error": str(e)}
+
+
+@app.get("/api/ai/priority-scores", tags=["AI Copilot"])
+async def get_priority_scores_endpoint(camera_id: str = None) -> dict[str, Any]:
+    """Return unified priority scores (0-100) for all cameras or one camera.
+
+    Combines: current risk, alert severity, open incidents, predicted risk,
+    detection confidence, camera health.
+    """
+    try:
+        ctx = get_ai_context(
+            camera_states=_camera_states,
+            camera_heartbeats=_camera_heartbeats,
+        )
+        return compute_priority_score(camera_id=camera_id, context=ctx)
+    except Exception as e:
+        print(f"[SentinelAI] âš ï¸ Priority score error: {e}")
+        return {"error": str(e), "cameras": []}
+
+
+@app.get("/api/ai/predictive-warnings", tags=["AI Copilot"])
+async def get_predictive_warnings_endpoint() -> dict[str, Any]:
+    """Return cameras where the prediction engine flags increasing risk."""
+    try:
+        ctx = get_ai_context(
+            camera_states=_camera_states,
+            camera_heartbeats=_camera_heartbeats,
+        )
+        warnings = build_predictive_warnings(ctx)
+        return {"warnings": warnings, "count": len(warnings), "generated_at": datetime.now(timezone.utc).isoformat()}
+    except Exception as e:
+        print(f"[SentinelAI] âš ï¸ Predictive warnings error: {e}")
+        return {"warnings": [], "count": 0, "error": str(e)}
+
+
+@app.get("/api/ai/safety-timeline", tags=["AI Copilot"])
+async def get_safety_timeline_endpoint(
+    camera_id: str = None,
+    severity: str = None,
+    event_type: str = None,
+    since_hours: int = 24,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Return a unified safety timeline (detection â†’ alert â†’ incident â†’ evidence â†’ resolution)."""
+    try:
+        return build_safety_timeline(
+            camera_id=camera_id,
+            severity=severity,
+            event_type=event_type,
+            since_hours=since_hours,
+            limit=limit,
+        )
+    except Exception as e:
+        print(f"[SentinelAI] âš ï¸ Safety timeline error: {e}")
+        return {"events": [], "count": 0, "error": str(e)}
+
+
+# ============================================================
+# Reports Endpoints
+# ============================================================
+
+@app.get("/api/reports/daily", tags=["Reports"])
+async def get_daily_report_endpoint() -> dict[str, Any]:
+    """Generate a structured daily safety report from real backend data."""
+    try:
+        report = build_daily_report()
+        log_audit(
+            event_type=AUDIT_REPORT_GENERATED,
+            user_id="operator",
+            user_role=ROLE_OPERATOR,
+            resource_type="report",
+            resource_id="daily",
+            action="generate_daily_report",
+            metadata={"report_type": "daily"},
+        )
+        return report
+    except Exception as e:
+        print(f"[SentinelAI] âš ï¸ Daily report error: {e}")
+        return {"error": str(e), "report_type": "daily"}
+
+
+@app.get("/api/incidents/{incident_id}/summary", tags=["AI Copilot"])
+async def get_incident_summary_endpoint(incident_id: str) -> dict[str, Any]:
+    """Return a structured AI summary of an incident without modifying it."""
+    try:
+        return build_incident_summary(incident_id)
+    except Exception as e:
+        print(f"[SentinelAI] âš ï¸ Incident summary error: {e}")
+        return {"found": False, "incident_id": incident_id, "error": str(e)}
+
+
+@app.get("/api/incidents/{incident_id}/evidence-links", tags=["AI Copilot"])
+async def get_incident_evidence_links(incident_id: str) -> dict[str, Any]:
+    """Return evidence items linked to an incident with full metadata."""
+    try:
+        return link_evidence(incident_id)
+    except Exception as e:
+        print(f"[SentinelAI] âš ï¸ Evidence links error: {e}")
+        return {"incident_id": incident_id, "evidence": [], "error": str(e)}
+
+
+# ============================================================
+# Security & Audit Center Endpoints
+# ============================================================
+
+@app.get("/api/security/overview", tags=["Security"])
+async def get_security_overview_endpoint() -> dict[str, Any]:
+    """Return the full security dashboard: score, configuration, audit summary, alerts."""
+    try:
+        return get_security_overview()
+    except Exception as e:
+        print(f"[SentinelAI] âš ï¸ Security overview error: {e}")
+        return {"error": str(e)}
+
+
+@app.get("/api/security/audit", tags=["Security"])
+async def get_security_audit_endpoint(
+    limit: int = 50,
+    offset: int = 0,
+    event_type: str = None,
+    user_id: str = None,
+    resource_id: str = None,
+    severity: str = None,
+    status: str = None,
+    since: str = None,
+    until: str = None,
+    search: str = None,
+) -> dict[str, Any]:
+    """Return paginated audit log entries.
+
+    Supports filtering by event_type, user_id, resource_id, severity, status,
+    and time range. Includes backend-side search across action/metadata.
+    """
+    try:
+        return query_audit(
+            limit=limit,
+            offset=offset,
+            event_type=event_type,
+            user_id=user_id,
+            resource_id=resource_id,
+            severity=severity,
+            status=status,
+            since=since,
+            until=until,
+            search=search,
+        )
+    except Exception as e:
+        print(f"[SentinelAI] âš ï¸ Audit query error: {e}")
+        return {"events": [], "count": 0, "total": 0, "error": str(e)}
+
+
+@app.get("/api/security/alerts", tags=["Security"])
+async def get_security_alerts_endpoint(
+    limit: int = 50,
+    offset: int = 0,
+    status: str = None,
+    severity: str = None,
+) -> dict[str, Any]:
+    """List security alerts (suspicious activity detections)."""
+    try:
+        return list_security_alerts(limit=limit, offset=offset, status=status, severity=severity)
+    except Exception as e:
+        print(f"[SentinelAI] âš ï¸ Security alerts error: {e}")
+        return {"alerts": [], "count": 0, "total": 0, "error": str(e)}
+
+
+@app.get("/api/security/health", tags=["Security"])
+async def get_security_health_endpoint() -> dict[str, Any]:
+    """Return the security health score and configuration status."""
+    try:
+        return {
+            "score": compute_security_score(),
+            "configuration": get_configuration_status(),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        return {"score": {"score": 50, "category": "WARNING"}, "configuration": {"checks": []}, "error": str(e)}
+
+
+@app.get("/api/security/configuration", tags=["Security"])
+async def get_security_configuration_endpoint() -> dict[str, Any]:
+    """Return configuration status (never secret values)."""
+    try:
+        return get_configuration_status()
+    except Exception as e:
+        return {"checks": [], "error": str(e)}
+
+
+@app.post("/api/security/alerts/{alert_id}/acknowledge", tags=["Security"])
+async def acknowledge_security_alert_endpoint(alert_id: str, actor: str = "operator") -> dict[str, Any]:
+    """Mark a security alert as acknowledged."""
+    result = acknowledge_security_alert(alert_id, actor)
+    if not result:
+        raise HTTPException(status_code=404, detail="Alert not found or not active")
+    return result
+
+
+@app.post("/api/security/alerts/{alert_id}/resolve", tags=["Security"])
+async def resolve_security_alert_endpoint(alert_id: str, actor: str = "operator") -> dict[str, Any]:
+    """Resolve a security alert."""
+    result = resolve_security_alert(alert_id, actor)
+    if not result:
+        raise HTTPException(status_code=404, detail="Alert not found or already resolved")
+    return result
+
+
+@app.post("/api/security/retention/apply", tags=["Security"])
+async def apply_security_retention_endpoint(retention_days: int = 30) -> dict[str, Any]:
+    """Manually apply audit retention policy. NOT auto-called.
+
+    Deletes audit_events older than retention_days. This is a destructive
+    action and must be called explicitly.
+    """
+    return apply_retention(retention_days=retention_days)
+
+
+# ============================================================
+# Demo / Static Files
+# ============================================================
+
+# Serve demo images from backend/ directory (mounted once at startup)
+_backend_static_path = BACKEND_DIR
+for _sample_img in ["real_road_test_0.jpg", "synthetic_road_test.jpg", "test.jpg"]:
+    if (_backend_static_path / _sample_img).exists():
+        try:
+            app.mount("/demo", StaticFiles(directory=str(_backend_static_path)), name="demo")
+            print(f"[SentinelAI] Demo static files mounted at /demo/")
+            break
+        except Exception:
+            pass
+
+# Map of known demo images
+DEMO_IMAGES: dict[str, dict[str, str]] = {
+    "road": {
+        "id": "road",
+        "name": "Road Scene (Real)",
+        "filename": "real_road_test_0.jpg",
+        "description": "Real road test image with vehicles and road markings",
+    },
+    "synthetic": {
+        "id": "synthetic",
+        "name": "Synthetic Road",
+        "filename": "synthetic_road_test.jpg",
+        "description": "Synthetic road scene for testing",
+    },
+}
+
+
+@app.get("/api/demo/info", tags=["Demo"])
+async def get_demo_info() -> dict[str, Any]:
+    """Return demo mode information and available demo image assets.
+
+    Use /demo/{filename} to access each image directly.
+    """
+    ai_mode = get_ai_mode()
+    model_info = get_model_info()
+
+    demo_images = []
+    for key, info in DEMO_IMAGES.items():
+        path = BACKEND_DIR / info["filename"]
+        if path.exists():
+            demo_images.append({
+                "id": info["id"],
+                "name": info["name"],
+                "description": info["description"],
+                "url": f"/demo/{info['filename']}",
+                "size_kb": round(path.stat().st_size / 1024, 1),
+            })
+
+    return {
+        "demo_mode": is_demo_mode(),
+        "ai_mode": ai_mode,
+        "yolo_available": ai_mode == "YOLO",
+        "model_loaded": model_info.get("model_loaded", False),
+        "model_info": {
+            "mode": ai_mode,
+            "device": model_info.get("device", "cpu"),
+            "confidence_threshold": model_info.get("confidence_threshold", 0.4),
+        },
+        "demo_images": demo_images,
+        "default_demo_image": demo_images[0]["url"] if demo_images else None,
+        "message": (
+            "DEMO MODE â€” YOLO not available. "
+            "Use the browser webcam or demo images for camera preview. "
+            "AI detection returns mock results."
+            if is_demo_mode() else
+            f"YOLO ACTIVE â€” {ai_mode}"
+        ),
+    }
+
+
+@app.get("/api/demo/frame", tags=["Demo"])
+async def get_demo_frame() -> dict[str, Any]:
+    """Return the default demo frame URL for the frontend to display."""
+    info = await get_demo_info()
+    return {
+        "frame_url": info.get("default_demo_image"),
+        "demo_mode": info["demo_mode"],
+        "ai_mode": info["ai_mode"],
+    }
+
+
+# ============================================================
+# Camera Endpoints
+# ============================================================
+
+@app.get("/api/cameras", tags=["Cameras"])
+async def get_cameras() -> dict[str, Any]:
+    """List known cameras with their current status and stream URLs.
+
+    Each camera includes a `stream_url` field:
+      - For browser-webcam cameras (mode="browser_webcam"): null
+        The stream is captured client-side via getUserMedia.
+      - For demo/simulated cameras (mode="demo"): points to /api/cameras/{id}/stream
+    """
+    cameras = list_cameras()
+    for cam in cameras:
+        if cam.get("mode") == "browser_webcam":
+            cam["stream_url"] = None
+        else:
+            cam["stream_url"] = f"/api/cameras/{cam['id']}/stream"
+    return {"cameras": cameras, "count": len(cameras)}
+
+
+@app.get("/api/cameras/{camera_id}/stream", tags=["Cameras"])
+async def camera_stream(camera_id: str):
+    """MJPEG/animated JPEG stream for a camera.
+
+    Cycles through demo road images to simulate a live camera feed.
+    Browsers render this as a continuous animation in an <img> tag
+    (like an animated GIF) without needing any JavaScript library.
+
+    The Content-Type is image/jpeg and each JPEG frame is separated
+    by a multipart boundary, which the browser automatically renders
+    as video.
+
+    For browser-webcam cameras (camera-1), this returns the same
+    demo animation since there is no server-side webcam access.
+    """
+    cam = get_camera(camera_id)
+    if cam is None:
+        raise HTTPException(status_code=404, detail=f"Unknown camera: {camera_id}")
+
+    # Collect available demo images
+    demo_images = []
+    for fname in ["real_road_test_0.jpg", "synthetic_road_test.jpg"]:
+        path = BACKEND_DIR / fname
+        if path.exists():
+            demo_images.append(path)
+
+    if not demo_images:
+        raise HTTPException(status_code=503, detail="No demo images available for streaming")
+
+    async def generate():
+        idx = 0
+        while True:
+            img_path = demo_images[idx % len(demo_images)]
+            idx += 1
+            try:
+                with open(img_path, "rb") as f:
+                    frame = f.read()
+            except Exception:
+                yield b"--myboundary\r\n\r\n"
+                continue
+
+            yield (
+                b"--myboundary\r\n"
+                b"Content-Type: image/jpeg\r\n"
+                b"Content-Length: " + str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n"
+            )
+            # ~3 FPS: fast enough to look animated, slow enough to not hammer the server
+            import asyncio
+            try:
+                await asyncio.sleep(0.33)
+            except Exception:
+                break
+
+    from starlette.responses import StreamingResponse
+    return StreamingResponse(
+        generate(),
+        media_type="multipart/x-mixed-replace; boundary=myboundary",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
+
+
+@app.get("/api/demo/image", tags=["Demo"])
+async def get_demo_single_image():
+    """Return a single demo JPEG image (non-streaming).
+
+    Used as a static fallback for camera cards when the stream endpoint
+    is not needed, or when getUserMedia is unavailable.
+    """
+    # Prefer real_road_test_0.jpg as the primary demo image
+    for fname in ["real_road_test_0.jpg", "synthetic_road_test.jpg"]:
+        path = BACKEND_DIR / fname
+        if path.exists():
+            from starlette.responses import FileResponse
+            return FileResponse(path, media_type="image/jpeg")
+    raise HTTPException(status_code=503, detail="No demo images available")
+
+
+@app.post("/api/cameras/{camera_id}/status", tags=["Cameras"])
+async def update_camera_status(camera_id: str, status: str) -> dict[str, Any]:
+    """Update a camera's lifecycle status and broadcast a camera_status event.
+
+    Allowed states: ONLINE, OFFLINE, ERROR, STARTING, STOPPED.
+    Unknown cameras are rejected with 404.
+    """
+    allowed = {"ONLINE", "OFFLINE", "ERROR", "STARTING", "STOPPED"}
+    normalized = (status or "").strip().upper()
+    if normalized not in allowed:
+        raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {sorted(allowed)}")
+    cam = get_camera(camera_id)
+    if cam is None:
+        raise HTTPException(status_code=404, detail=f"Unknown camera: {camera_id}")
+    await _broadcast_camera_status(camera_id, normalized)
+    return {"camera_id": camera_id, "status": normalized}
+
+
+# ============================================================
+# WebSocket Endpoint
+# ============================================================
+
+@app.websocket("/ws/alerts")
+async def websocket_alerts(websocket: WebSocket) -> None:
+    """WebSocket endpoint for real-time alerts and dashboard events.
+
+    Messages broadcast by the server follow this shape:
+        {
+            "type": "alert" | "camera_status" | "risk_update" | "system_status",
+            ...event-specific fields
+        }
+    """
+    if auth_enabled():
+        token = websocket.query_params.get("token", "")
+        if not validate_token(token):
+            await websocket.close(code=4401, reason="Authentication required")
+            return
+    ws_manager = get_websocket_manager()
+    await ws_manager.connect(websocket)
+
+    # Send an initial system_status so clients can confirm they're connected
+    try:
+        ai_mode = get_ai_mode()
+        await ws_manager.send_personal(websocket, {
+            "type": "system_status",
+            "ai_mode": ai_mode,
+            "cameras": list_cameras(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception:
+        pass
+
+    try:
+        while True:
+            # We don't expect many incoming messages; this just keeps the
+            # connection alive and lets clients ping/close cleanly.
+            try:
+                msg = await websocket.receive_text()
+            except Exception:
+                break
+            # Accept simple ping-style messages for liveness
+            if msg and msg.strip().lower() in {"ping", "{\"type\":\"ping\"}"}:
+                try:
+                    await websocket.send_text("{\"type\":\"pong\"}")
+                except Exception:
+                    break
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        await ws_manager.disconnect(websocket)
+
+

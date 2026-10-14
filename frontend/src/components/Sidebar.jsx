@@ -42,7 +42,7 @@ const Sidebar = () => {
         </button>
       </div>
       <nav className="sidebar-nav" aria-label="Dashboard navigation">
-        {navItems.map((item) => (
+        {navItems.map(item => (
           <div key={item.path} className={`nav-item${item.highlight ? ' nav-item--highlight' : ''}`}>
             <NavLink
               to={item.path}
